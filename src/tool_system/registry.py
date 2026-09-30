@@ -7,6 +7,21 @@ from .context import ToolContext
 from .permission_handler import PermissionResult
 from .protocol import ToolCall, ToolResult
 from .schema_validation import validate_json_schema
+from ..observability import log_event
+from ..security.permissions import ApprovalRequest, Decision, PermissionEngine
+
+_ENGINE = PermissionEngine()
+
+
+def _request_approval(request: ApprovalRequest, context: ToolContext, tool_check: PermissionResult) -> bool:
+    """Ask the caller's approval handler. No handler means no approval."""
+    if context.approval_handler is not None:
+        return bool(context.approval_handler(request))
+    if context.permission_handler is not None:
+        message = tool_check.message if tool_check.behavior.value == "ask" and tool_check.message else request.render()
+        allowed, _ = context.permission_handler(request.tool, message, tool_check.suggestion)
+        return bool(allowed)
+    return False
 
 
 @dataclass(frozen=True)
@@ -62,6 +77,20 @@ class ToolRegistry:
                 raise ValueError(f"duplicate tool alias: {alias}")
             self._by_name[alias_key] = tool
 
+    def subset(self, names: Iterable[str], *, extra: Iterable[Tool] = ()) -> "ToolRegistry":
+        """A registry exposing only ``names`` (plus ``extra`` tools), e.g. per agent profile."""
+        selected: list[Tool] = []
+        for name in names:
+            tool = self.get(name)
+            if tool is None:
+                raise ValueError(f"unknown tool: {name}")
+            if tool not in selected:
+                selected.append(tool)
+        registry = ToolRegistry(selected)
+        for tool in extra:
+            registry.register(tool)
+        return registry
+
     def list_specs(self) -> list[ToolSpec]:
         return [tool.spec() for tool in self._tools]
 
@@ -81,46 +110,47 @@ class ToolRegistry:
         context.ensure_tool_allowed(spec.name)
         validate_json_schema(call.input, spec.input_schema, root_name=spec.name)
 
-        # Check permissions before running
-        permission_result = tool.check_permissions(call.input, context) if hasattr(tool, 'check_permissions') else PermissionResult.allow()
-        if permission_result.behavior.value == "deny":
+        # Every invocation is evaluated by the permission engine: capabilities
+        # and risk of the call, the caller's policy (session or agent profile),
+        # explicit rules, and the tool's own check_permissions().
+        tool_check = tool.check_permissions(call.input, context) if hasattr(tool, 'check_permissions') else PermissionResult.allow()
+        decision = _ENGINE.evaluate(
+            spec.name, call.input, context.permission_policy, spec=spec, context=context, tool_check=tool_check,
+        )
+        if decision.decision is Decision.DENY:
+            log_event("permission.denied", tool=spec.name, agent_id=context.agent_id, task_id=context.task_id,
+                      capabilities=sorted(c.value for c in decision.assessment.capabilities),
+                      risk=decision.assessment.risk.name, reason=decision.message)
             return ToolResult(
                 name=spec.name,
-                output={"error": permission_result.message or "permission denied"},
+                output={"error": f"permission denied: {decision.message}"},
                 is_error=True,
                 tool_use_id=call.tool_use_id,
                 error_kind="permission",
             )
-        if permission_result.behavior.value == "ask":
-            # Need user interaction
-            if context.permission_handler is None:
-                # No handler available, deny by default
+        if decision.decision is Decision.ASK:
+            request = decision.approval_request(spec.name, agent_id=context.agent_id, task_id=context.task_id)
+            log_event("approval.requested", **request.to_dict())
+            approved = _request_approval(request, context, tool_check)
+            log_event("approval.approved" if approved else "approval.denied",
+                      approval_id=request.id, tool=spec.name, agent_id=context.agent_id, task_id=context.task_id,
+                      risk=request.risk, capabilities=list(request.capabilities))
+            if not approved:
                 return ToolResult(
                     name=spec.name,
-                    output={"error": permission_result.message or "permission required but no handler available"},
+                    output={
+                        "error": f"permission denied (not approved): {decision.message}",
+                        "approval": request.to_dict(),
+                    },
                     is_error=True,
                     tool_use_id=call.tool_use_id,
                     error_kind="permission",
                 )
-            # Call the permission handler
-            allowed, _ = context.permission_handler(
-                spec.name,
-                permission_result.message or f"Tool '{spec.name}' requires permission",
-                permission_result.suggestion,
-            )
-            if not allowed:
-                return ToolResult(
-                    name=spec.name,
-                    output={"error": f"permission denied (not approved): {permission_result.message or spec.name}"},
-                    is_error=True,
-                    tool_use_id=call.tool_use_id,
-                    error_kind="permission",
-                )
-            # User allowed - proceed with potentially updated input
-            if permission_result.updated_input:
+            # Approved - proceed with potentially updated input
+            if tool_check.updated_input:
                 call = ToolCall(
                     name=call.name,
-                    input=permission_result.updated_input,
+                    input=tool_check.updated_input,
                     tool_use_id=call.tool_use_id,
                 )
 

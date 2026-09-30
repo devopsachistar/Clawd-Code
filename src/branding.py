@@ -19,6 +19,10 @@ USER_DIR_NAME = ".clawd"          # ~/.clawd  (user config, sessions, history)
 PROJECT_DIR_NAME = ".clawd"       # <project>/.clawd  (project settings, skills)
 PROJECT_SETTINGS_FILE = "settings.json"
 ENV_PREFIXES: tuple[str, ...] = ("INCRESCENT", "CLAWD")
+# Multi-agent state (Phase 2)
+STATE_DIR_NAME = "increscent"                 # <git-common-dir>/increscent  (tasks, agents, events)
+WORKTREES_DIR_NAME = ".increscent-worktrees"  # sibling of the repository
+BRANCH_PREFIX = "increscent"                  # increscent/<task-id>/<role>
 
 
 def env_lookup(suffix: str, env: Mapping[str, str] | None = None) -> tuple[str | None, str | None]:

@@ -35,6 +35,20 @@ class ToolContext:
     # If not set, permission errors will be raised as exceptions.
     permission_handler: Callable[[str, str, Optional[str]], tuple[bool, bool]] | None = None
 
+    # Phase 2 permission engine. Every tool call is evaluated against this
+    # policy (defaults to the interactive session policy).
+    permission_policy: Any = None
+    # Structured approval callback: (ApprovalRequest) -> bool. Preferred over
+    # permission_handler when set.
+    approval_handler: Callable[[Any], bool] | None = None
+    # Attribution for approvals/events when running as an agent.
+    agent_id: str | None = None
+    task_id: str | None = None
+    # Structured result submitted by an agent via the ReportResult tool.
+    agent_result: dict[str, Any] | None = None
+    # Sink for agent -> orchestrator messages (MessageOrchestrator tool).
+    message_sink: Callable[[str, str], None] | None = None
+
     def __post_init__(self) -> None:
         self.workspace_root = Path(self.workspace_root).resolve()
         if self.cwd is None:
@@ -49,6 +63,16 @@ class ToolContext:
                 additional_working_directories=self.permission_context.additional_working_directories,
                 allow_docs=self.permission_context.allow_docs,
             )
+        if self.permission_policy is None:
+            from ..security.permissions import PermissionPolicy
+
+            self.permission_policy = PermissionPolicy.session_default()
+        # Secret boundary: learn this workspace's secret values so they can be
+        # masked wherever they would otherwise surface.
+        from ..security.secrets import register_environment_secrets, register_project_secrets
+
+        register_project_secrets(self.workspace_root)
+        register_environment_secrets()
 
     def mark_file_read(self, path: Path) -> None:
         stat = path.stat()

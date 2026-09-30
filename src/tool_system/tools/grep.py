@@ -11,6 +11,8 @@ from ..context import ToolContext
 from ..errors import ToolInputError
 from ..protocol import ToolResult
 from ..registry import ToolSpec
+from ..safety import is_secret_file
+from ...security.secrets import redact_secret_file
 
 
 _VCS_DIRS = {".git", ".svn", ".hg", ".bzr", ".jj", ".sl"}
@@ -144,6 +146,7 @@ class GrepTool:
             if regex.search(text) is None:
                 continue
             matched_files.append(file)
+            secret_file = is_secret_file(file)
 
             if output_mode == "content":
                 for line_no, line in enumerate(text.splitlines(), start=1):
@@ -151,7 +154,7 @@ class GrepTool:
                         continue
                     total_matches += len(list(regex.finditer(line)))
                     prefix = f"{file}:{line_no}:" if show_line_numbers else f"{file}:"
-                    content_lines.append(prefix + line)
+                    content_lines.append(prefix + (redact_secret_file(line) if secret_file else line))
             elif output_mode == "count":
                 matches = len(list(regex.finditer(text)))
                 total_matches += matches

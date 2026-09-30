@@ -74,6 +74,13 @@ class PowerShellTool(ShellCommandTool):
                     "command": {"type": "string"},
                     "cwd": {"type": "string"},
                     "timeout_s": {"type": "integer"},
+                    "secret_env": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Names of secrets (from project .env files or the environment) to inject "
+                                       "into the command's environment. Values are never shown to you; "
+                                       "requires explicit SECRET_USE approval.",
+                    },
                 },
                 "required": ["command"],
             },

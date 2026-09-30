@@ -112,6 +112,9 @@ class Session:
     state: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        """Serialisable form. Secret values never reach disk (see src/security/secrets.py)."""
+        from src.security.secrets import redact_structure
+
         return {
             "schema_version": SESSION_SCHEMA_VERSION,
             "session_id": self.session_id,
@@ -119,9 +122,9 @@ class Session:
             "model": self.model,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
-            "metadata": self.metadata,
-            "state": self.state,
-            "conversation": self.conversation.to_dict(),
+            "metadata": redact_structure(self.metadata),
+            "state": redact_structure(self.state),
+            "conversation": redact_structure(self.conversation.to_dict()),
         }
 
     def save(self, directory: str | Path | None = None) -> Path:

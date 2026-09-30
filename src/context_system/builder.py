@@ -99,10 +99,12 @@ def _render_claude_md_section(claude_md, workspace_root: Path) -> list[str]:
             label = f"./{rel}"
         except ValueError:
             label = str(item.path)
+        from src.security.secrets import redact_secrets
+
         lines.extend([
             f"### {label}",
             "```md",
-            item.content,
+            redact_secrets(item.content),
             "```",
         ])
     if claude_md.truncated:

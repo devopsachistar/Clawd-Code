@@ -273,6 +273,8 @@ def load_project_settings(project_root: str | Path | None) -> tuple[dict[str, An
     for key, value in data.items():
         if key in PROJECT_ALLOWED_KEYS and isinstance(value, str) and value.strip():
             clean[key] = value.strip()
+        elif key == "permissions":
+            continue  # handled by load_permission_rules (tighten-only)
         elif key not in PROJECT_ALLOWED_KEYS:
             warnings.append(
                 f"Ignoring '{key}' in project settings {path}: only {sorted(PROJECT_ALLOWED_KEYS)} "
@@ -395,3 +397,53 @@ def create_provider(resolved: ResolvedProviderConfig):
         raise ConfigError(missing_api_key_message(resolved))
     provider_class = get_provider_class(resolved.provider)
     return provider_class(api_key=resolved.api_key, base_url=resolved.base_url, model=resolved.model)
+
+
+# ---------------------------------------------------------------------------
+# Permission rules (Phase 2)
+# ---------------------------------------------------------------------------
+#
+# ~/.clawd/config.json and <project>/.clawd/settings.json may contain:
+#     "permissions": {"allow": ["Bash(npm test*)"], "ask": ["Write(*.lock)"], "deny": ["Bash(git push*)"]}
+# User rules may allow, ask or deny. Project rules (shipped inside a repository)
+# may only tighten (ask/deny): a cloned repo must not be able to pre-approve actions.
+
+def load_permission_rules(project_root: str | Path | None = None) -> tuple[list[Any], list[str]]:
+    from src.security.permissions import Decision, PermissionRule
+
+    rules: list[Any] = []
+    warnings: list[str] = []
+
+    def collect(section: Any, source: str, allowed: tuple[str, ...]) -> None:
+        if not isinstance(section, dict):
+            return
+        for decision in ("deny", "ask", "allow"):
+            for text in section.get(decision) or []:
+                if decision not in allowed:
+                    warnings.append(f"Ignoring {decision} rule {text!r} from {source}: project settings may only add ask/deny rules")
+                    continue
+                try:
+                    rules.append(PermissionRule.parse(str(text), Decision(decision.upper())))
+                except ValueError as e:
+                    warnings.append(f"Ignoring invalid rule {text!r} from {source}: {e}")
+
+    if get_config_path().exists():
+        collect(load_config(create_if_missing=False).get("permissions"), "user config", ("allow", "ask", "deny"))
+    if project_root is not None:
+        path = get_project_settings_path(project_root)
+        if path.is_file():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                data = {}
+            if isinstance(data, dict):
+                collect(data.get("permissions"), str(path), ("ask", "deny"))
+    return rules, warnings
+
+
+def load_session_policy(project_root: str | Path | None = None):
+    """Session policy (Phase 1 defaults) plus configured rules. Returns (policy, warnings)."""
+    from src.security.permissions import PermissionPolicy
+
+    rules, warnings = load_permission_rules(project_root)
+    return PermissionPolicy.session_default().with_rules(rules), warnings

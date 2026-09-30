@@ -67,6 +67,9 @@ Examples:
   {prog} run "Fix the failing tests"      Run one task non-interactively (scripts/CI)
   {prog} run --output json --yes "..."    JSON result, auto-approve risky actions
   {prog} sessions                 List saved sessions for this project
+  {prog} team "Build a todo app" --simulate   Multi-agent run (offline demo); stops before merging
+  {prog} tasks | agents | worktrees           Inspect multi-agent state
+  {prog} review <graph-id> [--merge]          Review; approve merge into the integration branch
   {prog} login                    Configure API keys
   {prog} config                   Show effective configuration (secrets masked)
   {prog} --version                Show version
@@ -132,6 +135,11 @@ Exit codes (run): 0 success, 1 task failure, 2 configuration error,
     sessions_parser = subparsers.add_parser('sessions', help='List saved sessions for this project')
     sessions_parser.add_argument('--all', action='store_true', help='List sessions from every project')
 
+    # Multi-agent commands (Phase 2)
+    from src.cli_team import add_team_commands
+
+    add_team_commands(subparsers, _add_common_flags)
+
     return parser
 
 def main(argv: list[str] | None = None):
@@ -168,6 +176,12 @@ def main(argv: list[str] | None = None):
         return handle_run(args)
     elif args.command == 'sessions':
         return handle_sessions(args)
+    else:
+        from src.cli_team import dispatch
+
+        handled = dispatch(args)
+        if handled is not None:
+            return handled
 
     # Default: start REPL
     return start_repl(

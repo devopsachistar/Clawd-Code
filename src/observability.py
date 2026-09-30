@@ -63,11 +63,14 @@ def redact_text(text: str) -> str:
     """Mask credential-looking substrings inside free text."""
     if not text:
         return text
+    from .security.secrets import redact_secrets
+
     out = text
     for pattern in _SECRET_VALUE_PATTERNS:
         out = pattern.sub(REDACTED, out)
     out = _ASSIGNMENT_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{REDACTED}", out)
-    return out
+    # Secret boundary: known secret values and remaining credential patterns.
+    return redact_secrets(out)
 
 
 def is_sensitive_key(key: str) -> bool:

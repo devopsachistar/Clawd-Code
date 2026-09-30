@@ -187,18 +187,27 @@ def run_headless(
         session = Session.create(resolved.provider, resolved.model, metadata=project.to_dict())
 
     # 4. Tools
-    context = ToolContext(workspace_root=project.project_root, cwd=project.cwd)
+    from .config import load_session_policy
+
+    policy, policy_warnings = load_session_policy(project.project_root)
+    for warning in policy_warnings:
+        note(f"warning: {warning}")
+    context = ToolContext(workspace_root=project.project_root, cwd=project.cwd, permission_policy=policy)
     for warning in restore_tool_state(context, session.state):
         note(f"warning: {warning}")
 
-    def permission_handler(tool_name: str, message: str, suggestion: Optional[str]) -> tuple[bool, bool]:
-        if options.auto_approve:
-            note(f"[auto-approved] {tool_name}: {redact_text(message)}")
-            return True, False
-        note(f"[denied] {tool_name}: {redact_text(message)} (re-run with --yes to approve)")
-        return False, False
+    def approval_handler(request: Any) -> bool:
+        # --yes only covers low/medium-risk requests. Production deploys,
+        # database writes, secret use, pushes and anything HIGH/CRITICAL
+        # always need an explicit human decision, which headless mode can't get.
+        if options.auto_approve and request.auto_approvable:
+            note(f"[auto-approved] {request.summary} (risk {request.risk}, {', '.join(request.capabilities)})")
+            return True
+        why = "re-run with --yes to approve" if request.auto_approvable else             f"risk {request.risk} / {', '.join(request.capabilities)} requires explicit approval; --yes does not cover it"
+        note(f"[denied] {request.summary}: {redact_text('; '.join(request.reasons))} ({why})")
+        return False
 
-    context.permission_handler = permission_handler
+    context.approval_handler = approval_handler
     registry = build_default_registry()
 
     def on_event(ev: ToolEvent) -> None:

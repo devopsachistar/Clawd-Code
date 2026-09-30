@@ -150,11 +150,21 @@ class ClawdREPL:
         self.autosave = autosave
 
         self.tool_registry = build_default_registry()
-        self.tool_context = ToolContext(workspace_root=self.project.project_root, cwd=self.project.cwd)
+        from src.config import load_session_policy
+
+        policy, policy_warnings = load_session_policy(self.project.project_root)
+        for warning in policy_warnings:
+            self.console.print(f"[yellow]warning: {warning}[/yellow]")
+        self.tool_context = ToolContext(workspace_root=self.project.project_root, cwd=self.project.cwd,
+                                        permission_policy=policy)
         self.tool_context.ask_user = self._ask_user_questions
         # Permission handler with status control for proper input handling
         self._current_status = None
         self.tool_context.permission_handler = self._handle_permission_request
+        # Structured approvals: show capability/risk details, always ask the user.
+        self.tool_context.approval_handler = lambda request: self._handle_permission_request(
+            request.tool, request.render(), None
+        )[0]
 
         # Original built-in commands - define this FIRST!
         self._original_built_ins = [

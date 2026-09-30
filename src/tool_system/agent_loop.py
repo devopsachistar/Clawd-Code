@@ -15,13 +15,22 @@ from ..agent.conversation import Conversation, TextContentBlock, ToolResultConte
 from ..agent.message_format import build_provider_request, resolve_wire_format, serialize_tool_result_content
 from ..context_system import build_context_prompt
 from ..observability import log_event
+from ..security.secrets import redact_secrets, redact_structure
 from ..outputStyles import resolve_output_style
 from ..providers.base import BaseProvider, ChatResponse
 
 
 def bound_tool_result_content(output: Any, limit: int | None) -> Any:
-    """Serialise a tool output for the conversation, enforcing the tool's size limit."""
+    """Serialise a tool output for the conversation, enforcing the tool's size limit.
+
+    This is the secret boundary for model context: every tool result passes
+    through :func:`redact_secrets` before it can reach a provider.
+    """
     content = serialize_tool_result_content(output)
+    if isinstance(content, str):
+        content = redact_secrets(content)
+    elif isinstance(content, list):
+        content = redact_structure(content)
     if not isinstance(content, str) or not limit or limit <= 0 or len(content) <= limit:
         return content
     omitted = len(content) - limit
@@ -103,6 +112,30 @@ class ToolEvent:
 
 STOP_COMPLETED = "completed"
 STOP_MAX_TURNS = "max_turns"
+STOP_BUDGET_TOOL_CALLS = "budget_tool_calls"
+STOP_BUDGET_TOKENS = "budget_tokens"
+STOP_TIMEOUT = "timeout"
+STOP_CANCELLED = "cancelled"
+
+
+@dataclass(frozen=True)
+class LoopBudget:
+    """Hard limits for one agent run (in addition to ``max_turns``).
+
+    ``deadline`` is a ``time.monotonic()`` timestamp. Limits are checked before
+    every model call and every tool call. A provider call that is already in
+    flight is not interrupted, but no further work starts after the deadline.
+    """
+
+    max_tool_calls: int | None = None
+    max_tokens: int | None = None
+    deadline: float | None = None
+
+    @classmethod
+    def from_seconds(cls, *, max_tool_calls: int | None = None, max_tokens: int | None = None,
+                     max_seconds: float | None = None) -> "LoopBudget":
+        deadline = time.monotonic() + max_seconds if max_seconds else None
+        return cls(max_tool_calls=max_tool_calls, max_tokens=max_tokens, deadline=deadline)
 
 
 @dataclass(frozen=True)
@@ -331,6 +364,8 @@ def run_agent_loop(
     on_event: ToolEventHandler | None = None,
     on_text_chunk: TextChunkHandler | None = None,
     system_prompt: str | None = None,
+    budget: LoopBudget | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> AgentLoopResult:
     """Run agent loop: LLM -> tools -> LLM until no more tools or max turns.
 
@@ -398,10 +433,39 @@ def run_agent_loop(
     log_event("agent.started", provider=provider_name, model=model_name, wire_format=wire_format,
               max_turns=max_turns, tools=len(tool_schemas), messages=len(conversation.messages))
 
+    def _limit_reached(before_tool: bool = False) -> str | None:
+        if should_cancel is not None and should_cancel():
+            return STOP_CANCELLED
+        if budget is None:
+            return None
+        if budget.deadline is not None and time.monotonic() >= budget.deadline:
+            return STOP_TIMEOUT
+        if not before_tool and budget.max_tokens is not None \
+                and total_usage["input_tokens"] + total_usage["output_tokens"] >= budget.max_tokens:
+            return STOP_BUDGET_TOKENS
+        if before_tool and budget.max_tool_calls is not None and tool_call_count >= budget.max_tool_calls:
+            return STOP_BUDGET_TOOL_CALLS
+        return None
+
+    _STOP_TEXT = {
+        STOP_CANCELLED: "[Cancelled]",
+        STOP_TIMEOUT: "[Time budget exhausted]",
+        STOP_BUDGET_TOKENS: "[Token budget exhausted]",
+        STOP_BUDGET_TOOL_CALLS: "[Tool-call budget exhausted]",
+    }
+
     for _turn in range(max_turns):
+        limit = _limit_reached()
+        if limit:
+            return _result(_STOP_TEXT[limit], limit)
         api_messages, format_kwargs = build_provider_request(
             conversation.messages, system_prompt=system_prompt, wire_format=wire_format,
         )
+        # Secret boundary (outgoing): whatever the history contains, including
+        # model-written tool inputs and user-pasted text, no known secret value or
+        # credential pattern leaves for the provider.
+        api_messages = redact_structure(api_messages)
+        format_kwargs = redact_structure(format_kwargs)
         call_kwargs: dict[str, Any] = {"tools": tool_schemas, **format_kwargs}
 
         log_event("provider.request", provider=provider_name, model=model_name,
@@ -456,7 +520,18 @@ def run_agent_loop(
 
         # Execute every tool call, then record all results as one user turn.
         result_blocks: list[ToolResultContentBlock] = []
+        stop_after_batch: str | None = None
         for tool_use in tool_uses:
+            limit = stop_after_batch or _limit_reached(before_tool=True)
+            if limit:
+                # Keep the call/result pairing intact, but do not execute.
+                stop_after_batch = limit
+                result_blocks.append(ToolResultContentBlock(
+                    tool_use_id=str(tool_use.get("id", "")),
+                    content=f"Tool call not executed: {_STOP_TEXT[limit].strip('[]')}.",
+                    is_error=True,
+                ))
+                continue
             block, output, error_kind = _execute_tool_call(tool_use, tool_registry, tool_context, on_event, verbose)
             result_blocks.append(block)
             tool_call_count += 1
@@ -476,5 +551,7 @@ def run_agent_loop(
                     except Exception:
                         last_user_visible_message = str(payload)
         conversation.add_tool_results(result_blocks)
+        if stop_after_batch:
+            return _result(_STOP_TEXT[stop_after_batch], stop_after_batch)
 
     return _result("[Max tool turns reached]", STOP_MAX_TURNS)

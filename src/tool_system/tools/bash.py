@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shlex
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,7 @@ from ..protocol import ToolResult
 from ..registry import ToolSpec
 from ..safety import classify_command
 from ..shell import IS_WINDOWS, ShellSpec, detect_shell, run_shell_command
+from ...security.secrets import lookup_secret, redact_secrets
 
 
 def _truncate(s: str, limit: int = 20000) -> str:
@@ -114,14 +116,40 @@ class ShellCommandTool:
         except RuntimeError as e:
             return ToolResult(name=self.tool_name, output={"error": str(e)}, is_error=True, error_kind="execution")
 
-        completed = run_shell_command(command, cwd=cwd, timeout_s=timeout_s, shell=shell)
+        env = None
+        secret_names = tool_input.get("secret_env") or []
+        if secret_names:
+            # Controlled secret use: values go into the child environment only.
+            # The permission engine has already required SECRET_USE approval,
+            # and every value is registered so it is masked in all output.
+            if not isinstance(secret_names, list) or not all(isinstance(n, str) and n for n in secret_names):
+                raise ToolInputError("secret_env must be a list of environment variable names")
+            env = dict(os.environ)
+            missing = []
+            for name in secret_names:
+                value = lookup_secret(name, context.workspace_root)
+                if value is None:
+                    missing.append(name)
+                else:
+                    env[name] = value
+            if missing:
+                return ToolResult(
+                    name=self.tool_name,
+                    output={"error": f"secret(s) not found in project .env files or environment: {', '.join(missing)}"},
+                    is_error=True,
+                    error_kind="input",
+                )
+
+        completed = run_shell_command(command, cwd=cwd, timeout_s=timeout_s, shell=shell, env=env)
         output: dict[str, Any] = {
             "cwd": str(cwd),
             "shell": completed.shell,
             "exit_code": completed.exit_code,
-            "stdout": _truncate(completed.stdout),
-            "stderr": _truncate(completed.stderr),
+            "stdout": redact_secrets(_truncate(completed.stdout)),
+            "stderr": redact_secrets(_truncate(completed.stderr)),
         }
+        if secret_names:
+            output["secret_env"] = list(secret_names)
         if completed.timed_out:
             output["timed_out"] = True
             output["error"] = f"command timed out after {timeout_s}s (process tree terminated)"
@@ -154,6 +182,13 @@ class BashTool(ShellCommandTool):
                     "command": {"type": "string"},
                     "cwd": {"type": "string"},
                     "timeout_s": {"type": "integer"},
+                    "secret_env": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Names of secrets (from project .env files or the environment) to inject "
+                                       "into the command's environment. Values are never shown to you; "
+                                       "requires explicit SECRET_USE approval.",
+                    },
                 },
                 "required": ["command"],
             },

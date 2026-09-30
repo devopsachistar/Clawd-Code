@@ -53,3 +53,6 @@ Documentation = "https://github.com/GPT-AGI/Clawd-Codex#readme"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["src*"]
+
+[tool.setuptools.package-data]
+"src.agents" = ["profiles/*.md"]

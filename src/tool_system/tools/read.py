@@ -10,6 +10,8 @@ from ..context import ToolContext
 from ..errors import ToolExecutionError, ToolInputError
 from ..protocol import ToolResult
 from ..registry import ToolSpec
+from ..safety import is_secret_file
+from ...security.secrets import redact_secret_file
 
 
 class FileReadTool:
@@ -83,6 +85,11 @@ class FileReadTool:
         except Exception as e:
             raise ToolExecutionError(str(e)) from e
 
+        secret_file = is_secret_file(path)
+        if secret_file:
+            # Keys stay visible so the model can reason about configuration,
+            # values never enter model context.
+            text = redact_secret_file(text)
         lines = text.splitlines()
         start = offset - 1
         end = start + limit
@@ -101,6 +108,7 @@ class FileReadTool:
                     "numLines": len(sliced),
                     "startLine": offset,
                     "totalLines": len(lines),
+                    **({"secretsRedacted": True} if secret_file else {}),
                 },
             },
         )
