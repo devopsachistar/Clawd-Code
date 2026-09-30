@@ -40,23 +40,50 @@ class Message:
     """Conversation message."""
     role: str  # "user", "assistant", "system"
     content: Union[str, list[ContentBlock]]
-    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+    timestamp: str = field(default_factory=lambda: datetime.now().astimezone().isoformat())
     # Internal marker for messages that should be filtered from API (e.g., compact boundary)
     _is_internal: bool = field(default=False, repr=False)
 
 
+def _is_turn_start(message: Message) -> bool:
+    """True for a user message that starts a new exchange (not a tool result)."""
+    if message.role != "user" or getattr(message, "_is_internal", False):
+        return False
+    if isinstance(message.content, str):
+        return True
+    return not any(isinstance(b, ToolResultContentBlock) for b in message.content)
+
+
 @dataclass
 class Conversation:
-    """Conversation manager."""
+    """Conversation manager.
+
+    This is the provider-neutral source of truth for a session. Provider wire
+    formats are produced by :mod:`src.agent.message_format`.
+    """
     messages: list[Message] = field(default_factory=list)
     max_history: int = 100
 
     def add_message(self, role: str, content: Union[str, list[ContentBlock]]):
-        """Add a message to conversation."""
-        if len(self.messages) >= self.max_history:
-            self.messages.pop(0)
-
+        """Add a message to conversation, trimming history safely."""
         self.messages.append(Message(role=role, content=content))
+        self._trim_history()
+
+    def _trim_history(self) -> None:
+        """Drop the oldest messages beyond ``max_history``.
+
+        Trimming only ever cuts at the start of a user turn, so a tool call is
+        never separated from its tool result. If no safe cut point exists (one
+        very long tool loop), the history is allowed to exceed the soft limit
+        rather than corrupting it.
+        """
+        if self.max_history <= 0 or len(self.messages) <= self.max_history:
+            return
+        overflow = len(self.messages) - self.max_history
+        for idx in range(overflow, len(self.messages)):
+            if _is_turn_start(self.messages[idx]):
+                del self.messages[:idx]
+                return
 
     def add_user_message(self, text: str):
         """Add a plain user text message."""
@@ -66,46 +93,31 @@ class Conversation:
         """Add an assistant message (text or tool use)."""
         self.add_message("assistant", content)
 
-    def add_tool_result_message(self, tool_use_id: str, content: Union[str, list[dict]], is_error: bool = False):
-        """Add a tool result message."""
-        block = ToolResultContentBlock(
-            type="tool_result",
-            tool_use_id=tool_use_id,
-            content=content,
-            is_error=is_error
+    def add_tool_result_message(self, tool_use_id: str, content: Any, is_error: bool = False):
+        """Add a single tool result message."""
+        self.add_tool_results([
+            ToolResultContentBlock(type="tool_result", tool_use_id=tool_use_id, content=content, is_error=is_error)
+        ])
+
+    def add_tool_results(self, results: list[ToolResultContentBlock]):
+        """Add all tool results of one assistant turn as a single user message."""
+        if results:
+            self.add_message("user", list(results))
+
+    def has_tool_blocks(self) -> bool:
+        """Whether any message contains tool_use or tool_result blocks."""
+        return any(
+            isinstance(b, (ToolUseContentBlock, ToolResultContentBlock))
+            for m in self.messages
+            if not isinstance(m.content, str)
+            for b in m.content
         )
-        self.add_message("user", [block])
 
     def get_messages(self) -> list[dict]:
-        """Get messages in API format (Anthropic style)."""
-        api_messages = []
-        for msg in self.messages:
-            # Skip internal messages (e.g., compact boundary markers)
-            if getattr(msg, "_is_internal", False):
-                continue
-            if isinstance(msg.content, str):
-                api_messages.append({"role": msg.role, "content": msg.content})
-            else:
-                content_blocks = []
-                for block in msg.content:
-                    if isinstance(block, TextContentBlock):
-                        content_blocks.append({"type": "text", "text": block.text})
-                    elif isinstance(block, ToolUseContentBlock):
-                        content_blocks.append({
-                            "type": "tool_use",
-                            "id": block.id,
-                            "name": block.name,
-                            "input": block.input
-                        })
-                    elif isinstance(block, ToolResultContentBlock):
-                        content_blocks.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.tool_use_id,
-                            "content": block.content,
-                            "is_error": block.is_error
-                        })
-                api_messages.append({"role": msg.role, "content": content_blocks})
-        return api_messages
+        """Get messages in API format (Anthropic style), with tool pairs repaired."""
+        from .message_format import to_anthropic_messages
+
+        return to_anthropic_messages(self.messages)
 
     def clear(self):
         """Clear conversation."""

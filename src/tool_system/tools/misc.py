@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import platform
 from typing import Any
 
 from ..context import ToolContext
-from ..errors import ToolInputError, ToolPermissionError
+from ..errors import ToolInputError
 from ..protocol import ToolResult
 from ..registry import ToolSpec
+from .bash import ShellCommandTool
 
 
 class SendMessageTool:
@@ -54,26 +54,33 @@ class RemoteTriggerTool:
         return ToolResult(name="RemoteTrigger", output={"error": "RemoteTrigger is not implemented"}, is_error=True)
 
 
-class PowerShellTool:
+class PowerShellTool(ShellCommandTool):
+    """Run PowerShell (pwsh or Windows PowerShell) with the shared shell safety checks."""
+
+    tool_name = "PowerShell"
+    preferred_shell = "powershell"
+
     def spec(self) -> ToolSpec:
         return ToolSpec(
             name="PowerShell",
-            description="Run a PowerShell command (Windows only).",
+            description=(
+                "Run a PowerShell command (pwsh or Windows PowerShell) in the project. "
+                "Destructive commands require user approval; catastrophic ones are refused."
+            ),
             input_schema={
                 "type": "object",
                 "additionalProperties": False,
-                "properties": {"command": {"type": "string"}},
+                "properties": {
+                    "command": {"type": "string"},
+                    "cwd": {"type": "string"},
+                    "timeout_s": {"type": "integer"},
+                },
                 "required": ["command"],
             },
             is_destructive=True,
             max_result_size_chars=200_000,
             strict=True,
         )
-
-    def run(self, tool_input: dict[str, Any], context: ToolContext) -> ToolResult:
-        if platform.system().lower() != "windows":
-            return ToolResult(name="PowerShell", output={"error": "PowerShell is only supported on Windows"}, is_error=True)
-        raise ToolPermissionError("PowerShell execution is not enabled in this build")
 
 
 class NotebookEditTool:

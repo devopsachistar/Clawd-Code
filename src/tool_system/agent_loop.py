@@ -3,28 +3,29 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .registry import ToolRegistry
 from .context import ToolContext
-from ..agent.conversation import Conversation, TextContentBlock, ToolUseContentBlock
+from .errors import ToolInputError, ToolPermissionError
+from .protocol import ToolCall
+from ..agent.conversation import Conversation, TextContentBlock, ToolResultContentBlock, ToolUseContentBlock
+from ..agent.message_format import build_provider_request, resolve_wire_format, serialize_tool_result_content
 from ..context_system import build_context_prompt
+from ..observability import log_event
 from ..outputStyles import resolve_output_style
 from ..providers.base import BaseProvider, ChatResponse
-from ..providers.anthropic_provider import AnthropicProvider
-from ..providers.minimax_provider import MinimaxProvider
 
 
-def _is_anthropic_provider(provider: BaseProvider) -> bool:
-    return isinstance(provider, (AnthropicProvider, MinimaxProvider))
-
-
-def _build_openai_tool_result_content(result_output: Any) -> str:
-    """Format tool result as string for OpenAI/GLM."""
-    if isinstance(result_output, str):
-        return result_output
-    return json.dumps(result_output, ensure_ascii=False)
+def bound_tool_result_content(output: Any, limit: int | None) -> Any:
+    """Serialise a tool output for the conversation, enforcing the tool's size limit."""
+    content = serialize_tool_result_content(output)
+    if not isinstance(content, str) or not limit or limit <= 0 or len(content) <= limit:
+        return content
+    omitted = len(content) - limit
+    return content[:limit] + f"\n\n... [tool output truncated: {omitted} characters omitted]"
 
 def summarize_tool_result(name: str, output: Any) -> str:
     """Create a concise, single-line summary for tool result output."""
@@ -100,12 +101,21 @@ class ToolEvent:
     error: str | None = None
 
 
+STOP_COMPLETED = "completed"
+STOP_MAX_TURNS = "max_turns"
+
+
 @dataclass(frozen=True)
 class AgentLoopResult:
     """Result of running the agent loop."""
     response_text: str
     usage: dict[str, Any] | None = None  # {"input_tokens": int, "output_tokens": int}
     num_turns: int = 0
+    stop_reason: str = STOP_COMPLETED  # "completed" | "max_turns"
+    tool_calls: int = 0
+    tool_errors: int = 0
+    # One entry per tool call blocked by permission/safety policy or denied by the user.
+    permission_denials: tuple[dict[str, Any], ...] = field(default_factory=tuple)
 
 
 ToolEventHandler = Callable[[ToolEvent], None]
@@ -237,6 +247,79 @@ def summarize_tool_use(name: str, tool_input: dict[str, Any]) -> str:
 
 
 
+def _execute_tool_call(
+    tool_use: dict[str, Any],
+    tool_registry: ToolRegistry,
+    tool_context: ToolContext,
+    on_event: ToolEventHandler | None,
+    verbose: bool,
+) -> tuple[ToolResultContentBlock, Any, str | None]:
+    """Run one tool call. Returns (result block, raw output, error_kind)."""
+    tool_id = str(tool_use.get("id", ""))
+    tool_name = str(tool_use.get("name", ""))
+    tool_input = tool_use.get("input") or {}
+    if not isinstance(tool_input, dict):
+        tool_input = {}
+
+    _safe_call_handler(on_event, ToolEvent(kind="tool_use", tool_name=tool_name, tool_input=tool_input, tool_use_id=tool_id))
+    log_event("tool.started", tool=tool_name, tool_use_id=tool_id, input=tool_input)
+    started = time.monotonic()
+
+    tool = tool_registry.get(tool_name)
+    limit = tool.spec().max_result_size_chars if tool is not None else None
+    try:
+        result = tool_registry.dispatch(ToolCall(name=tool_name, input=tool_input, tool_use_id=tool_id), tool_context)
+    except Exception as e:  # the tool raised instead of returning an error result
+        if isinstance(e, ToolPermissionError):
+            error_kind = "permission"
+        elif isinstance(e, ToolInputError):
+            error_kind = "input"
+        else:
+            error_kind = "execution"
+        error_str = f"Error: {e}"
+        if verbose:
+            print(f"[Tool Error] {error_str}")
+        _safe_call_handler(on_event, ToolEvent(
+            kind="tool_error", tool_name=tool_name, tool_input=tool_input,
+            tool_use_id=tool_id, is_error=True, error=error_str,
+        ))
+        log_event(
+            "permission.denied" if error_kind == "permission" else "tool.failed",
+            tool=tool_name, tool_use_id=tool_id, error_kind=error_kind, error=str(e),
+            duration_ms=int((time.monotonic() - started) * 1000),
+        )
+        block = ToolResultContentBlock(tool_use_id=tool_id, content=error_str, is_error=True)
+        return block, {"error": error_str}, error_kind
+
+    output = result.output
+    error_kind = result.error_kind if result.is_error else None
+    if result.is_error and error_kind is None:
+        error_kind = "execution"
+    if verbose:
+        use_summary = summarize_tool_use(tool_name, tool_input)
+        if use_summary:
+            print(f"{tool_name} · {use_summary}")
+        print(summarize_tool_result(tool_name, output))
+    _safe_call_handler(on_event, ToolEvent(
+        kind="tool_result", tool_name=tool_name, tool_output=output,
+        tool_use_id=tool_id, is_error=result.is_error,
+    ))
+    duration_ms = int((time.monotonic() - started) * 1000)
+    if error_kind == "permission":
+        log_event("permission.denied", tool=tool_name, tool_use_id=tool_id, output=output, duration_ms=duration_ms)
+    elif result.is_error:
+        log_event("tool.failed", tool=tool_name, tool_use_id=tool_id, error_kind=error_kind, output=output, duration_ms=duration_ms)
+    else:
+        log_event("tool.completed", tool=tool_name, tool_use_id=tool_id, duration_ms=duration_ms)
+
+    block = ToolResultContentBlock(
+        tool_use_id=tool_id,
+        content=bound_tool_result_content(output, limit),
+        is_error=result.is_error,
+    )
+    return block, output, error_kind
+
+
 def run_agent_loop(
     conversation: Conversation,
     provider: BaseProvider,
@@ -247,222 +330,151 @@ def run_agent_loop(
     verbose: bool = False,
     on_event: ToolEventHandler | None = None,
     on_text_chunk: TextChunkHandler | None = None,
+    system_prompt: str | None = None,
 ) -> AgentLoopResult:
     """Run agent loop: LLM -> tools -> LLM until no more tools or max turns.
+
+    The conversation is the single source of truth. Every assistant turn
+    (including tool calls) and every tool result is persisted to it, and each
+    provider request is rebuilt from it via :mod:`src.agent.message_format`, so
+    the system prompt and full tool history are present on every request for
+    every provider.
 
     Args:
         conversation: Conversation with initial user message
         provider: LLM provider
         tool_registry: Tool registry to use
         tool_context: Tool context
-        max_turns: Maximum tool turns before stopping
+        max_turns: Maximum model turns before stopping
         stream: Whether to stream responses
         verbose: Whether to print tool calls/results
         on_event: Optional callback for tool events
         on_text_chunk: Optional callback for incremental user-visible text chunks
+        system_prompt: Optional explicit system prompt (defaults to output style + project context)
 
     Returns:
-        AgentLoopResult with final text response, usage info, and turn count
+        AgentLoopResult with final text response, usage info, turn count and stop reason
     """
-    # Convert tools to schemas (Anthropic format)
-    tool_schemas = []
-    for spec in tool_registry.list_specs():
-        tool_schemas.append({
-            "name": spec.name,
-            "description": spec.description,
-            "input_schema": spec.input_schema,
-        })
+    tool_schemas = [
+        {"name": spec.name, "description": spec.description, "input_schema": spec.input_schema}
+        for spec in tool_registry.list_specs()
+    ]
 
-    # For OpenAI/GLM, keep separate message list in OpenAI format
-    openai_messages: list[dict[str, Any]] = []
+    if system_prompt is None:
+        style_name = getattr(tool_context, "output_style_name", None)
+        style_dir = getattr(tool_context, "output_style_dir", None)
+        style_prompt = resolve_output_style(style_name, style_dir).prompt
+        system_prompt = _build_effective_system_prompt(style_prompt, tool_context)
+
+    wire_format = resolve_wire_format(provider)
+    model_name = getattr(provider, "model", None)
+    provider_name = type(provider).__name__
     last_user_visible_message: str | None = None
-    style_name = getattr(tool_context, "output_style_name", None)
-    style_dir = getattr(tool_context, "output_style_dir", None)
-    style_prompt = resolve_output_style(style_name, style_dir).prompt
-    effective_system_prompt = _build_effective_system_prompt(style_prompt, tool_context)
-
-    # Seed OpenAI messages from initial conversation messages
-    for msg in conversation.messages:
-        if isinstance(msg.content, str):
-            openai_messages.append({"role": msg.role, "content": msg.content})
-        else:
-            # If there are already block messages, we are probably Anthropic; leave as is
-            pass
-
-    # Track usage across all turns
     total_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
     turn_count = 0
+    tool_call_count = 0
+    tool_error_count = 0
+    denials: list[dict[str, Any]] = []
 
-    for turn in range(max_turns):
-        if _is_anthropic_provider(provider):
-            api_messages = conversation.get_messages()
-        else:
-            # Use OpenAI formatted messages for non-Anthropic
-            api_messages = openai_messages
+    def _usage() -> dict[str, int] | None:
+        return total_usage if total_usage["input_tokens"] > 0 or total_usage["output_tokens"] > 0 else None
 
-        call_kwargs: dict[str, Any] = {"tools": tool_schemas}
-        if _is_anthropic_provider(provider):
-            call_kwargs["system"] = effective_system_prompt
-        else:
-            if turn == 0:
-                api_messages = [{"role": "system", "content": effective_system_prompt}, *api_messages]
-        response, streamed_live_text = _call_provider_for_turn(
-            provider=provider,
-            api_messages=api_messages,
-            call_kwargs=call_kwargs,
-            stream=stream,
-            on_text_chunk=on_text_chunk,
+    def _result(text: str, stop_reason: str) -> AgentLoopResult:
+        log_event(
+            "agent.completed" if stop_reason == STOP_COMPLETED else "agent.max_turns",
+            turns=turn_count, tool_calls=tool_call_count, tool_errors=tool_error_count,
+            permission_denials=len(denials), usage=_usage(), stop_reason=stop_reason,
         )
+        return AgentLoopResult(
+            response_text=text,
+            usage=_usage(),
+            num_turns=turn_count,
+            stop_reason=stop_reason,
+            tool_calls=tool_call_count,
+            tool_errors=tool_error_count,
+            permission_denials=tuple(denials),
+        )
+
+    log_event("agent.started", provider=provider_name, model=model_name, wire_format=wire_format,
+              max_turns=max_turns, tools=len(tool_schemas), messages=len(conversation.messages))
+
+    for _turn in range(max_turns):
+        api_messages, format_kwargs = build_provider_request(
+            conversation.messages, system_prompt=system_prompt, wire_format=wire_format,
+        )
+        call_kwargs: dict[str, Any] = {"tools": tool_schemas, **format_kwargs}
+
+        log_event("provider.request", provider=provider_name, model=model_name,
+                  turn=turn_count + 1, messages=len(api_messages), stream=stream)
+        started = time.monotonic()
+        try:
+            response, streamed_live_text = _call_provider_for_turn(
+                provider=provider,
+                api_messages=api_messages,
+                call_kwargs=call_kwargs,
+                stream=stream,
+                on_text_chunk=on_text_chunk,
+            )
+        except Exception as e:
+            log_event("provider.error", provider=provider_name, model=model_name,
+                      turn=turn_count + 1, error_type=type(e).__name__, error=str(e))
+            raise
         turn_count += 1
 
-        # Collect usage info
         if response.usage:
-            total_usage["input_tokens"] += response.usage.get("input_tokens", 0)
-            total_usage["output_tokens"] += response.usage.get("output_tokens", 0)
+            total_usage["input_tokens"] += response.usage.get("input_tokens", 0) or 0
+            total_usage["output_tokens"] += response.usage.get("output_tokens", 0) or 0
 
-        # Build assistant content for Anthropic or just text for OpenAI
         final_assistant_content = response.content or ""
+        tool_uses = [tu for tu in (response.tool_uses or []) if isinstance(tu, dict)]
+        log_event("provider.response", model=getattr(response, "model", model_name), turn=turn_count,
+                  finish_reason=response.finish_reason, tool_calls=len(tool_uses), usage=response.usage,
+                  duration_ms=int((time.monotonic() - started) * 1000))
 
-        if _is_anthropic_provider(provider):
+        # Persist the assistant turn (text and tool calls) to the neutral conversation.
+        if tool_uses:
             assistant_blocks: list = []
-            if response.content:
-                assistant_blocks.append(TextContentBlock(type="text", text=response.content))
-
-            tool_uses = response.tool_uses or []
+            if final_assistant_content:
+                assistant_blocks.append(TextContentBlock(type="text", text=final_assistant_content))
             for tool_use in tool_uses:
                 assistant_blocks.append(ToolUseContentBlock(
                     type="tool_use",
-                    id=tool_use["id"],
-                    name=tool_use["name"],
-                    input=tool_use["input"],
+                    id=str(tool_use.get("id", "")),
+                    name=str(tool_use.get("name", "")),
+                    input=dict(tool_use.get("input") or {}),
                 ))
-
-            conversation.add_assistant_message(assistant_blocks if assistant_blocks else "")
+            conversation.add_assistant_message(assistant_blocks)
         else:
-            # Persist assistant text for session history features like /render-last
-            # and for subsequent non-Anthropic turns seeded from conversation.
             conversation.add_assistant_message(final_assistant_content)
-            # Add assistant message to OpenAI messages (text only)
-            openai_assistant_msg: dict[str, Any] = {"role": "assistant", "content": final_assistant_content}
-            # If there are tool_uses, add them in OpenAI format
-            if response.tool_uses:
-                # Build OpenAI tool_calls
-                tool_calls = []
-                for tu in response.tool_uses:
-                    tool_calls.append({
-                        "id": tu["id"],
-                        "type": "function",
-                        "function": {
-                            "name": tu["name"],
-                            "arguments": json.dumps(tu["input"], ensure_ascii=False)
-                        }
-                    })
-                openai_assistant_msg["tool_calls"] = tool_calls
-            openai_messages.append(openai_assistant_msg)
-
-        tool_uses = response.tool_uses or []
 
         if not tool_uses:
-            # No more tools, done
             if stream and final_assistant_content and not streamed_live_text:
                 _emit_text_chunks(on_text_chunk, final_assistant_content)
-            if (final_assistant_content or "").strip() == "" and last_user_visible_message is not None:
-                return AgentLoopResult(
-                    response_text=last_user_visible_message,
-                    usage=total_usage if total_usage["input_tokens"] > 0 or total_usage["output_tokens"] > 0 else None,
-                    num_turns=turn_count,
-                )
-            return AgentLoopResult(
-                response_text=final_assistant_content,
-                usage=total_usage if total_usage["input_tokens"] > 0 or total_usage["output_tokens"] > 0 else None,
-                num_turns=turn_count,
-            )
+            if final_assistant_content.strip() == "" and last_user_visible_message is not None:
+                return _result(last_user_visible_message, STOP_COMPLETED)
+            return _result(final_assistant_content, STOP_COMPLETED)
 
-        # Call each tool
+        # Execute every tool call, then record all results as one user turn.
+        result_blocks: list[ToolResultContentBlock] = []
         for tool_use in tool_uses:
-            tool_id = tool_use["id"]
-            tool_name = tool_use["name"]
-            tool_input = tool_use["input"]
-
-            try:
-                _safe_call_handler(
-                    on_event,
-                    ToolEvent(
-                        kind="tool_use",
-                        tool_name=tool_name,
-                        tool_input=tool_input,
-                        tool_use_id=tool_id,
-                    ),
-                )
-                # Use dispatch to get proper validation and result wrapping
-                from ..tool_system.protocol import ToolCall
-                call = ToolCall(name=tool_name, input=tool_input, tool_use_id=tool_id)
-                result = tool_registry.dispatch(call, tool_context)
-                result_output = result.output
-                if tool_name.lower() == "sendusermessage" and isinstance(result_output, dict):
-                    msg = result_output.get("message")
-                    if isinstance(msg, str):
-                        last_user_visible_message = msg
-                if tool_name.lower() == "structuredoutput" and isinstance(result_output, dict):
-                    payload = result_output.get("structured_output")
+            block, output, error_kind = _execute_tool_call(tool_use, tool_registry, tool_context, on_event, verbose)
+            result_blocks.append(block)
+            tool_call_count += 1
+            tool_name = str(tool_use.get("name", ""))
+            if block.is_error:
+                tool_error_count += 1
+            if error_kind == "permission":
+                message = output.get("error") if isinstance(output, dict) else str(output)
+                denials.append({"tool": tool_name, "tool_use_id": block.tool_use_id, "message": message})
+            if not block.is_error and isinstance(output, dict):
+                if tool_name.lower() == "sendusermessage" and isinstance(output.get("message"), str):
+                    last_user_visible_message = output["message"]
+                if tool_name.lower() == "structuredoutput":
+                    payload = output.get("structured_output")
                     try:
                         last_user_visible_message = json.dumps(payload, ensure_ascii=False, indent=2)
                     except Exception:
                         last_user_visible_message = str(payload)
+        conversation.add_tool_results(result_blocks)
 
-                if verbose:
-                    use_summary = summarize_tool_use(tool_name, tool_input)
-                    if use_summary:
-                        print(f"{tool_name} · {use_summary}")
-                    summary = summarize_tool_result(tool_name, result_output)
-                    print(f"{summary}")
-
-                _safe_call_handler(
-                    on_event,
-                    ToolEvent(
-                        kind="tool_result",
-                        tool_name=tool_name,
-                        tool_output=result_output,
-                        tool_use_id=tool_id,
-                        is_error=result.is_error,
-                    ),
-                )
-                if _is_anthropic_provider(provider):
-                    conversation.add_tool_result_message(tool_id, result_output)
-                else:
-                    # Add tool result in OpenAI format
-                    openai_messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_id,
-                        "content": _build_openai_tool_result_content(result_output)
-                    })
-            except Exception as e:
-                error_str = f"Error: {e}"
-                if verbose:
-                    print(f"[Tool Error] {error_str}")
-                _safe_call_handler(
-                    on_event,
-                    ToolEvent(
-                        kind="tool_error",
-                        tool_name=tool_name,
-                        tool_input=tool_input,
-                        tool_use_id=tool_id,
-                        is_error=True,
-                        error=error_str,
-                    ),
-                )
-                if _is_anthropic_provider(provider):
-                    conversation.add_tool_result_message(tool_id, error_str, is_error=True)
-                else:
-                    openai_messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_id,
-                        "content": error_str
-                    })
-
-    # Reached max turns
-    return AgentLoopResult(
-        response_text="[Max tool turns reached]",
-        usage=total_usage if total_usage["input_tokens"] > 0 or total_usage["output_tokens"] > 0 else None,
-        num_turns=turn_count,
-    )
+    return _result("[Max tool turns reached]", STOP_MAX_TURNS)

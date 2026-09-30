@@ -13,11 +13,19 @@ class ProviderInfo(TypedDict):
     default_base_url: str
     default_model: str
     available_models: list[str]
+    # Environment variables checked (in order) for the API key / base URL.
+    api_key_env: list[str]
+    base_url_env: list[str]
+    # Wire format spoken by the provider ("anthropic" | "openai").
+    wire_format: str
 
 
 PROVIDER_INFO: dict[str, ProviderInfo] = {
     "anthropic": {
         "label": "Anthropic Claude",
+        "api_key_env": ["ANTHROPIC_API_KEY"],
+        "base_url_env": ["ANTHROPIC_BASE_URL"],
+        "wire_format": "anthropic",
         "default_base_url": "https://api.anthropic.com",
         "default_model": "claude-sonnet-4-6",
         "available_models": [
@@ -46,6 +54,9 @@ PROVIDER_INFO: dict[str, ProviderInfo] = {
     },
     "openai": {
         "label": "OpenAI GPT",
+        "api_key_env": ["OPENAI_API_KEY"],
+        "base_url_env": ["OPENAI_BASE_URL"],
+        "wire_format": "openai",
         "default_base_url": "https://api.openai.com/v1",
         "default_model": "gpt-5.4",
         "available_models": [
@@ -71,6 +82,9 @@ PROVIDER_INFO: dict[str, ProviderInfo] = {
     },
     "glm": {
         "label": "Zhipu GLM (z.ai)",
+        "api_key_env": ["ZHIPUAI_API_KEY", "GLM_API_KEY", "ZAI_API_KEY"],
+        "base_url_env": ["GLM_BASE_URL"],
+        "wire_format": "openai",
         "default_base_url": "https://open.bigmodel.cn/api/paas/v4",
         "default_model": "zai/glm-5",
         "available_models": [
@@ -91,6 +105,9 @@ PROVIDER_INFO: dict[str, ProviderInfo] = {
     },
     "minimax": {
         "label": "Minimax AI",
+        "api_key_env": ["MINIMAX_API_KEY"],
+        "base_url_env": ["MINIMAX_BASE_URL"],
+        "wire_format": "anthropic",
         "default_base_url": "https://api.minimaxi.com/anthropic",
         "default_model": "MiniMax-M2.7",
         "available_models": [
@@ -116,25 +133,32 @@ def get_provider_info(provider_name: str) -> ProviderInfo:
     return PROVIDER_INFO[provider_name]
 
 
+# Provider implementations, imported lazily so optional SDKs are not required
+# just to start the CLI. New providers (e.g. Gemini, Qwen, Ollama) register an
+# entry here plus a PROVIDER_INFO record, or call ``register_provider``.
+_PROVIDER_CLASSES: dict[str, tuple[str, str]] = {
+    "anthropic": ("src.providers.anthropic_provider", "AnthropicProvider"),
+    "openai": ("src.providers.openai_provider", "OpenAIProvider"),
+    "glm": ("src.providers.glm_provider", "GLMProvider"),
+    "minimax": ("src.providers.minimax_provider", "MinimaxProvider"),
+}
+
+
+def register_provider(name: str, module: str, class_name: str, info: ProviderInfo) -> None:
+    """Register an additional provider implementation (extension point)."""
+    _PROVIDER_CLASSES[name] = (module, class_name)
+    PROVIDER_INFO[name] = info
+
+
 def get_provider_class(provider_name: str):
     """Get provider class by name."""
-    if provider_name == "anthropic":
-        from .anthropic_provider import AnthropicProvider
+    entry = _PROVIDER_CLASSES.get(provider_name)
+    if entry is None:
+        raise ValueError(f"Unknown provider: {provider_name}")
+    import importlib
 
-        return AnthropicProvider
-    if provider_name == "openai":
-        from .openai_provider import OpenAIProvider
-
-        return OpenAIProvider
-    if provider_name == "glm":
-        from .glm_provider import GLMProvider
-
-        return GLMProvider
-    if provider_name == "minimax":
-        from .minimax_provider import MinimaxProvider
-
-        return MinimaxProvider
-    raise ValueError(f"Unknown provider: {provider_name}")
+    module = importlib.import_module(entry[0])
+    return getattr(module, entry[1])
 
 
 # Legacy registry for display purposes
@@ -146,6 +170,7 @@ __all__ = [
     "ChatMessage",
     "ChatResponse",
     "get_provider_class",
+    "register_provider",
     "get_provider_info",
     "PROVIDER_INFO",
     "AVAILABLE_PROVIDERS",

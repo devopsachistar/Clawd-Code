@@ -10,6 +10,7 @@ from ..permission_handler import PermissionResult
 from ..protocol import ToolResult
 from ..diff_utils import unified_diff_hunks
 from ..registry import ToolSpec
+from ..safety import contains_credential, is_secret_file
 
 
 class FileWriteTool:
@@ -43,6 +44,16 @@ class FileWriteTool:
             path = context.ensure_allowed_path(file_path)
         except ToolPermissionError:
             return PermissionResult.allow()  # Path validation happens in run()
+
+        if is_secret_file(path):
+            return PermissionResult.ask(
+                message=f"Writing a secret/environment file requires approval: {path.name}",
+            )
+        new_text = tool_input.get("content")
+        if isinstance(new_text, str) and contains_credential(new_text):
+            return PermissionResult.ask(
+                message=f"Writing {path.name} would store what looks like a real credential/API key; approval required",
+            )
 
         if path.suffix.lower() in {".md", ".markdown"} and not context.permission_context.allow_docs:
             return PermissionResult.ask(

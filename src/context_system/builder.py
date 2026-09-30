@@ -22,7 +22,9 @@ def build_context_prompt(
 
     sections: list[str] = []
 
-    sections.append("\n".join(_render_workspace_section(workspace)))
+    workspace_lines = _render_workspace_section(workspace)
+    workspace_lines[2:2] = _render_project_lines(root, git)
+    sections.append("\n".join(workspace_lines))
 
     git_lines = _render_git_section(git, root)
     if git_lines:
@@ -33,6 +35,22 @@ def build_context_prompt(
         sections.append("\n".join(md_lines))
 
     return "\n\n".join(section for section in sections if section.strip())
+
+
+def _render_project_lines(root: Path, git) -> list[str]:
+    """Explicit project identity plus the OS/shell the tools will use."""
+    import platform
+
+    from src.tool_system.shell import shell_description
+
+    lines = [f"- Project root: {root}"]
+    if git.available and git.repo_root is not None:
+        lines.append(f"- Git root: {git.repo_root}")
+    else:
+        lines.append("- Git root: (not a git repository)")
+    lines.append(f"- Operating system: {platform.system()} {platform.release()}")
+    lines.append(f"- Shell used by the Bash tool: {shell_description()}")
+    return lines
 
 
 def _render_workspace_section(workspace) -> list[str]:

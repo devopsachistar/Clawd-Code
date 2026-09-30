@@ -36,7 +36,15 @@ TextChunkCallback: TypeAlias = Callable[[str], None]
 
 
 class BaseProvider(ABC):
-    """Base class for LLM providers."""
+    """Base class for LLM providers.
+
+    Subclasses declare the wire format they speak via ``message_format``
+    (``"anthropic"`` or ``"openai"``). Conversation history is converted once,
+    centrally, by :mod:`src.agent.message_format`; providers never re-implement
+    conversation handling.
+    """
+
+    message_format: str = "openai"
 
     def __init__(
         self, api_key: str, base_url: Optional[str] = None, model: Optional[str] = None

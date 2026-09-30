@@ -22,6 +22,8 @@ from .base import BaseProvider, ChatResponse, MessageInput, TextChunkCallback
 class AnthropicProvider(BaseProvider):
     """Anthropic Claude provider."""
 
+    message_format = "anthropic"
+
     def __init__(
         self, api_key: str, base_url: Optional[str] = None, model: Optional[str] = None
     ):

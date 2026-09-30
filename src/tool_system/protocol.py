@@ -18,4 +18,9 @@ class ToolResult:
     is_error: bool = False
     tool_use_id: Optional[str] = None
     content_type: Literal["text", "json"] = "json"
+    # Why the call failed, when is_error is True:
+    #   "permission" - blocked by permission/safety policy or denied by the user
+    #   "input"      - invalid tool input
+    #   "execution"  - the tool ran and failed
+    error_kind: Optional[Literal["permission", "input", "execution"]] = None
 

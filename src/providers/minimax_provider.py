@@ -27,6 +27,7 @@ class MinimaxProvider(BaseProvider):
     """
 
     DEFAULT_BASE_URL = "https://api.minimaxi.com/anthropic"
+    message_format = "anthropic"
 
     def __init__(
         self, api_key: str, base_url: Optional[str] = None, model: Optional[str] = None

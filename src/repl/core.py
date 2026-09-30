@@ -73,12 +73,14 @@ import json
 from typing import Any
 
 from src.agent import Session
-from src.config import get_provider_config
+from src.agent.message_format import build_provider_request, resolve_wire_format
+from src.agent.session import capture_tool_state, latest_session_id, restore_tool_state
+from src.config import get_provider_config, load_config
+from src.observability import log_event
 from src.outputStyles import resolve_output_style
+from src.project import ProjectInfo, detect_project
 from src.providers import get_provider_class
-from src.providers.anthropic_provider import AnthropicProvider
 from src.providers.base import ChatMessage
-from src.providers.minimax_provider import MinimaxProvider
 from src.tool_system.context import ToolContext
 from src.tool_system.defaults import build_default_registry
 from src.tool_system.protocol import ToolCall
@@ -100,21 +102,34 @@ from src.history import HistoryLog
 class ClawdREPL:
     """Interactive REPL for Clawd Codex."""
 
-    def __init__(self, provider_name: str = "glm", stream: bool = False):
+    def __init__(
+        self,
+        provider_name: str = "glm",
+        stream: bool = False,
+        *,
+        resolved: Any = None,
+        project: ProjectInfo | None = None,
+        autosave: bool | None = None,
+    ):
         self.console = Console()
-        self.provider_name = provider_name
+        self.provider_name = resolved.provider if resolved is not None else provider_name
         self.stream = stream
         self.multiline_mode = False
+        self.project = project or detect_project(Path.cwd())
 
-        # Load configuration
-        config = get_provider_config(provider_name)
+        # Load configuration: a pre-resolved config (CLI/env/project/user layers)
+        # or, for backwards compatibility, the user config for provider_name.
+        if resolved is not None:
+            config = {"api_key": resolved.api_key, "base_url": resolved.base_url, "default_model": resolved.model}
+        else:
+            config = get_provider_config(self.provider_name)
         if not config.get("api_key"):
             self.console.print("[red]Error: API key not configured.[/red]")
             self.console.print("Run [bold]clawd login[/bold] to configure.")
-            sys.exit(1)
+            sys.exit(2)
 
         # Initialize provider
-        provider_class = get_provider_class(provider_name)
+        provider_class = get_provider_class(self.provider_name)
         self.provider = provider_class(
             api_key=config["api_key"],
             base_url=config.get("base_url"),
@@ -123,12 +138,19 @@ class ClawdREPL:
 
         # Create session
         self.session = Session.create(
-            provider_name,
-            self.provider.model
+            self.provider_name,
+            self.provider.model,
+            metadata=self.project.to_dict(),
         )
+        if autosave is None:
+            try:
+                autosave = bool(load_config(create_if_missing=False).get("session", {}).get("auto_save", True))
+            except Exception:
+                autosave = True
+        self.autosave = autosave
 
         self.tool_registry = build_default_registry()
-        self.tool_context = ToolContext(workspace_root=Path.cwd())
+        self.tool_context = ToolContext(workspace_root=self.project.project_root, cwd=self.project.cwd)
         self.tool_context.ask_user = self._ask_user_questions
         # Permission handler with status control for proper input handling
         self._current_status = None
@@ -144,6 +166,7 @@ class ClawdREPL:
             "/clear",
             "/save",
             "/load",
+            "/resume",
             "/multiline",
             "/stream",
             "/render-last",
@@ -157,11 +180,11 @@ class ClawdREPL:
         # Initialize new command system
         self._init_command_system()
 
-        # Prompt toolkit with tab completion
-        history_file = Path.home() / ".clawd" / "history"
-        history_file.parent.mkdir(parents=True, exist_ok=True)
-
         self.completer = WordCompleter(self._get_slash_command_words(), ignore_case=True)
+        # The prompt_toolkit session needs a real terminal (on Windows,
+        # constructing it without a console raises), so it is created lazily
+        # on first interactive use. Constructing a REPL stays side-effect free.
+        self._prompt_session = None
 
         # Key bindings for multiline
         self.bindings = KeyBindings()
@@ -173,16 +196,30 @@ class ClawdREPL:
                     buf.insert_text("/")
                     buf.start_completion(select_first=False)
 
-        self.prompt_session = PromptSession(
-            history=FileHistory(str(history_file)),
-            auto_suggest=AutoSuggestFromHistory(),
-            completer=self.completer,
-            style=Style.from_dict({
-                'prompt': 'bold blue',
-            }),
-            key_bindings=self.bindings,
-            complete_while_typing=True,
-        )
+
+    @property
+    def prompt_session(self):
+        """Interactive prompt (created on first use; requires a terminal)."""
+        if self._prompt_session is None:
+            from src.config import get_user_dir
+
+            history_file = get_user_dir() / "history"
+            history_file.parent.mkdir(parents=True, exist_ok=True)
+            self._prompt_session = PromptSession(
+                history=FileHistory(str(history_file)),
+                auto_suggest=AutoSuggestFromHistory(),
+                completer=self.completer,
+                style=Style.from_dict({
+                    'prompt': 'bold blue',
+                }),
+                key_bindings=self.bindings,
+                complete_while_typing=True,
+            )
+        return self._prompt_session
+
+    @prompt_session.setter
+    def prompt_session(self, value) -> None:
+        self._prompt_session = value
 
     def _ask_user_questions(self, questions: list[dict]) -> dict[str, str]:
         # Stop the Rich status spinner if running, so we can get clean input
@@ -354,7 +391,7 @@ class ClawdREPL:
 
         # Create command context
         self.command_context = create_command_context(
-            workspace_root=Path.cwd(),
+            workspace_root=self.project.project_root,
             conversation=self.session.conversation,
             cost_tracker=self.cost_tracker,
             history=self.history_log,
@@ -475,8 +512,9 @@ class ClawdREPL:
             except TypeError:
                 base = WordCompleter(words, ignore_case=True)
             self.completer = FuzzyCompleter(base) if FuzzyCompleter is not None else base
-            if hasattr(self, "prompt_session") and getattr(self.prompt_session, "completer", None) is not None:
-                self.prompt_session.completer = self.completer
+            session = getattr(self, "_prompt_session", None)
+            if session is not None and getattr(session, "completer", None) is not None:
+                session.completer = self.completer
         except Exception:
             return
 
@@ -597,6 +635,10 @@ class ClawdREPL:
         table.add_row("Model", Text(model_label, style="bold magenta"))
         table.add_row("Provider", Text(provider_label, style="bold green"))
         table.add_row("Workspace", Text(self._truncate_middle(display_path, content_width - 12), style="bold blue"))
+        project = getattr(self, "project", None)
+        if project is not None:
+            label = f"{project.name} (git)" if project.is_git_repo else f"{project.name} (no git)"
+            table.add_row("Project", Text(self._truncate_middle(label, content_width - 12), style="bold green"))
 
         footer = Text("/help  •  /tools  •  /stream  •  /render-last  •  /exit", style="dim")
         mascot_block = Text(mascot_ascii, style="bold orange3", no_wrap=True)
@@ -676,7 +718,7 @@ class ClawdREPL:
             special_commands = {
                 'exit', 'quit', 'q',
                 'help', 'tools', 'tool',
-                'save', 'load', 'multiline', 'stream', 'render-last',
+                'save', 'load', 'resume', 'multiline', 'stream', 'render-last',
                 'skill',
                 'context', 'compact',  # These need special handling
                 ''
@@ -822,6 +864,17 @@ class ClawdREPL:
             rendered = self._render_last_assistant_message()
             if not rendered:
                 self.console.print("[yellow]No assistant response available to render.[/yellow]")
+
+        elif cmd == '/resume' or cmd.startswith('/resume '):
+            parts = command.strip().split(maxsplit=1)
+            session_id = parts[1].strip() if len(parts) > 1 else latest_session_id(
+                project_root=self.project.project_root
+            )
+            current = getattr(self.session, "session_id", None)
+            if not session_id or session_id == current:
+                self.console.print("[yellow]No earlier saved session for this project.[/yellow]")
+            else:
+                self.load_session(session_id)
 
         elif cmd.startswith('/load'):
             parts = command.strip().split(maxsplit=1)
@@ -1019,28 +1072,26 @@ class ClawdREPL:
         return False
 
     def _provider_uses_system_kwarg(self) -> bool:
-        return isinstance(self.provider, (AnthropicProvider, MinimaxProvider))
+        return resolve_wire_format(self.provider) == "anthropic"
 
     def _build_direct_stream_payload(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         style_name = getattr(self.tool_context, "output_style_name", None)
         style_dir = getattr(self.tool_context, "output_style_dir", None)
         style_prompt = resolve_output_style(style_name, style_dir).prompt
-
-        if self._provider_uses_system_kwarg():
-            return self.session.conversation.get_messages(), (
-                {"system": style_prompt} if style_prompt.strip() else {}
-            )
-
-        messages: list[dict[str, Any]] = []
-        for msg in self.session.conversation.messages:
-            if isinstance(msg.content, str):
-                messages.append({"role": msg.role, "content": msg.content})
-        if style_prompt.strip():
-            messages = [{"role": "system", "content": style_prompt}, *messages]
-        return messages, {}
+        return build_provider_request(
+            self.session.conversation.messages,
+            system_prompt=style_prompt,
+            wire_format=resolve_wire_format(self.provider),
+        )
 
     def _should_try_direct_stream(self, user_input: str) -> bool:
         if not self.stream:
+            return False
+        # A tool-free request cannot carry tool history (Anthropic rejects
+        # tool blocks without tool definitions); use the agent loop instead.
+        conversation = getattr(self.session, "conversation", None)
+        has_tool_blocks = getattr(conversation, "has_tool_blocks", None)
+        if callable(has_tool_blocks) and has_tool_blocks() is True:
             return False
         text = user_input.strip().lower()
         if not text or text.startswith("/"):
@@ -1122,6 +1173,22 @@ class ClawdREPL:
             user_input: The user message to send.
             max_turns: Maximum number of tool call turns (default 20, higher for complex commands).
         """
+        try:
+            self._chat(user_input, max_turns)
+        finally:
+            self._autosave()
+
+    def _autosave(self) -> None:
+        """Persist the session after each turn (session.auto_save, default on)."""
+        if not getattr(self, "autosave", False):
+            return
+        try:
+            self.session.state = capture_tool_state(self.tool_context)
+            self.session.save()
+        except Exception as e:  # never break the REPL over persistence
+            log_event("session.save_failed", error=str(e))
+
+    def _chat(self, user_input: str, max_turns: int = 20):
         # Add user message
         self.session.conversation.add_user_message(user_input)
 
@@ -1318,6 +1385,10 @@ class ClawdREPL:
 
     def save_session(self):
         """Save current session."""
+        try:
+            self.session.state = capture_tool_state(self.tool_context)
+        except Exception:
+            pass
         self.session.save()
         self.console.print(f"[green]Session saved: {self.session.session_id}[/green]")
 
@@ -1334,8 +1405,20 @@ class ClawdREPL:
             self.console.print(f"[red]Session not found: {session_id}[/red]")
             return
 
-        # Replace current session
+        # Replace current session (and everything that referenced the old conversation)
         self.session = loaded_session
+        if getattr(self, "command_context", None) is not None:
+            self.command_context.conversation = loaded_session.conversation
+        state = getattr(loaded_session, "state", None)
+        for warning in restore_tool_state(self.tool_context, state if isinstance(state, dict) else None):
+            self.console.print(f"[yellow]{warning}[/yellow]")
+        metadata = getattr(loaded_session, "metadata", None)
+        saved_root = metadata.get("project_root") if isinstance(metadata, dict) else None
+        if isinstance(saved_root, str) and saved_root != str(self.project.project_root):
+            self.console.print(
+                f"[yellow]Note: this session was recorded in {saved_root}; "
+                f"tools now operate in {self.project.project_root}.[/yellow]"
+            )
         self.console.print(f"[green]Session loaded: {session_id}[/green]")
         self.console.print(f"[dim]Provider: {loaded_session.provider}, Model: {loaded_session.model}[/dim]")
         self.console.print(f"[dim]Messages: {len(loaded_session.conversation.messages)}[/dim]")
@@ -1345,4 +1428,24 @@ class ClawdREPL:
             self.console.print("\n[bold]Conversation History:[/bold]")
             for msg in loaded_session.conversation.messages[-5:]:  # Show last 5 messages
                 role_color = "blue" if msg.role == "user" else "green"
-                self.console.print(f"[{role_color}]{msg.role}[/{role_color}]: {msg.content[:100]}...")
+                self.console.print(f"[{role_color}]{msg.role}[/{role_color}]: {_message_preview(msg)}")
+
+
+def _message_preview(message: Any, limit: int = 100) -> str:
+    """One-line preview of a stored message (text, tool calls or tool results)."""
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        text = content
+    else:
+        parts: list[str] = []
+        for block in content or []:
+            btype = getattr(block, "type", None)
+            if btype == "text":
+                parts.append(getattr(block, "text", ""))
+            elif btype == "tool_use":
+                parts.append(f"[tool call: {getattr(block, 'name', '?')}]")
+            elif btype == "tool_result":
+                parts.append("[tool result]")
+        text = " ".join(p for p in parts if p)
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[: limit - 3] + "..."

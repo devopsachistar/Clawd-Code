@@ -54,6 +54,10 @@ def _run_git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str] | None:
             cwd=str(cwd),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdin=subprocess.DEVNULL,
+            timeout=10,
             check=False,
         )
     except Exception:

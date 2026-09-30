@@ -89,6 +89,7 @@ class ToolRegistry:
                 output={"error": permission_result.message or "permission denied"},
                 is_error=True,
                 tool_use_id=call.tool_use_id,
+                error_kind="permission",
             )
         if permission_result.behavior.value == "ask":
             # Need user interaction
@@ -99,6 +100,7 @@ class ToolRegistry:
                     output={"error": permission_result.message or "permission required but no handler available"},
                     is_error=True,
                     tool_use_id=call.tool_use_id,
+                    error_kind="permission",
                 )
             # Call the permission handler
             allowed, _ = context.permission_handler(
@@ -109,9 +111,10 @@ class ToolRegistry:
             if not allowed:
                 return ToolResult(
                     name=spec.name,
-                    output={"error": "permission denied by user"},
+                    output={"error": f"permission denied (not approved): {permission_result.message or spec.name}"},
                     is_error=True,
                     tool_use_id=call.tool_use_id,
+                    error_kind="permission",
                 )
             # User allowed - proceed with potentially updated input
             if permission_result.updated_input:
@@ -129,6 +132,7 @@ class ToolRegistry:
                 is_error=result.is_error,
                 tool_use_id=call.tool_use_id,
                 content_type=result.content_type,
+                error_kind=result.error_kind,
             )
         return result
 

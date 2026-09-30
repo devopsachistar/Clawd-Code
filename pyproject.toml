@@ -42,6 +42,8 @@ dev = [
 
 [project.scripts]
 clawd = "src.cli:main"
+# Same entry point under the future product name (not a separate application).
+increscent = "src.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/GPT-AGI/Clawd-Codex"

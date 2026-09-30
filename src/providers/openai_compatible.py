@@ -13,6 +13,31 @@ from typing import Any, Generator, Optional
 from .base import BaseProvider, ChatResponse, MessageInput, TextChunkCallback
 
 
+def _merge_object_alternatives(schema: dict[str, Any]) -> dict[str, Any] | None:
+    """Collapse a top-level ``anyOf``/``oneOf`` of object schemas into one object.
+
+    OpenAI-style function parameters must be ``type: object`` at the root, so
+    a union such as the Skill tool's two input forms would otherwise be dropped.
+    Properties are merged; only properties required by every alternative stay
+    required. The tool still validates its real input against the original schema.
+    """
+    alternatives = schema.get("anyOf") or schema.get("oneOf")
+    if not isinstance(alternatives, list) or not alternatives:
+        return None
+    if not all(isinstance(a, dict) and a.get("type") == "object" for a in alternatives):
+        return None
+    properties: dict[str, Any] = {}
+    required: set[str] | None = None
+    for alt in alternatives:
+        properties.update(alt.get("properties") or {})
+        alt_required = set(alt.get("required") or [])
+        required = alt_required if required is None else required & alt_required
+    merged: dict[str, Any] = {"type": "object", "properties": properties}
+    if required:
+        merged["required"] = sorted(required)
+    return merged
+
+
 def _convert_to_openai_tool_schema(anthropic_tool: dict[str, Any]) -> dict[str, Any] | None:
     """Convert Anthropic tool schema to OpenAI/GLM/Minimax function format.
 
@@ -21,6 +46,8 @@ def _convert_to_openai_tool_schema(anthropic_tool: dict[str, Any]) -> dict[str, 
     input_schema = anthropic_tool.get("input_schema")
     if not input_schema or not isinstance(input_schema, dict):
         return None
+    if input_schema.get("type") is None:
+        input_schema = _merge_object_alternatives(input_schema) or input_schema
     schema_type = input_schema.get("type")
     if schema_type is None or schema_type == "None":
         return None
@@ -47,6 +74,8 @@ class OpenAICompatibleProvider(BaseProvider):
 
     The client is created lazily on first use.
     """
+
+    message_format = "openai"
 
     def __init__(
         self,
