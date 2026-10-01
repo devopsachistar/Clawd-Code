@@ -123,25 +123,29 @@ class DeveloperAgent:
         approval_handler: Optional[ApprovalHandler] = None,
         test_command: Optional[str] = None,
         test_timeout_s: int = 600,
+        runner: Optional[AgentRunner] = None,
     ) -> None:
         self.profiles = profiles or ProfileRegistry.load()
         self.profile = self.profiles.get(profile)
         self.provider_name, self.model = provider, model
-        self.events = events or EventRecorder(None)
+        self.events = events or (runner.events if runner is not None else EventRecorder(None))
         self.test_command = test_command
         self.test_timeout_s = test_timeout_s
-        self.runner = AgentRunner(provider_factory=provider_factory, events=self.events, store=store,
-                                  approval_handler=approval_handler, sessions_dir=sessions_dir)
+        # Reuse an existing AgentRunner (e.g. the Orchestrator's: same store, bus, approvals) when given.
+        self.runner = runner or AgentRunner(provider_factory=provider_factory, events=self.events, store=store,
+                                            approval_handler=approval_handler, sessions_dir=sessions_dir)
 
     def execute(self, task: TaskSpec, workspace: str | Path,
-                should_cancel: Optional[Callable[[], bool]] = None) -> DeveloperResult:
+                should_cancel: Optional[Callable[[], bool]] = None, *, profile: Optional[str] = None) -> DeveloperResult:
+        """Run ``task`` in ``workspace``. ``profile`` overrides the agent profile (default: Developer)."""
+        agent_profile = self.profiles.get(profile) if profile else self.profile
         root = Path(workspace).resolve()
         if not root.is_dir():
             return DeveloperResult(status="failed", task_id=task.key, summary="", workspace=str(root),
                                    error=f"workspace does not exist: {root}")
         hinted_command = self.test_command or detect_test_command(root)
         before = snapshot(root)
-        agent = self.runner.create_agent(self.profile, task_id=task.key, working_directory=root,
+        agent = self.runner.create_agent(agent_profile, task_id=task.key, working_directory=root,
                                          provider=self.provider_name, model=self.model)
         self.events.emit("developer.started", task_id=task.key, agent_id=agent.id, workspace=str(root))
         agent_result = self.runner.run(agent, build_assignment(task, root, hinted_command), should_cancel=should_cancel)

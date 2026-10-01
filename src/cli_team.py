@@ -24,7 +24,11 @@ def add_team_commands(subparsers: argparse._SubParsersAction, add_common) -> Non
     team.add_argument("--plan", metavar="FILE", help="JSON plan file instead of the standard plan")
     team.add_argument("--resume", metavar="GRAPH_ID", help="Continue an existing graph (ready/retryable tasks)")
     team.add_argument("--parallel", type=int, default=1, help="Agents to run concurrently (default 1)")
-    team.add_argument("--max-attempts", type=int, default=3, help="Attempts per task incl. retries (default 3)")
+    team.add_argument("--max-attempts", type=int, default=None,
+                      help="Attempts per task incl. retries (default 3; 1 with --ai-plan)")
+    team.add_argument("--ai-plan", action="store_true",
+                      help="Plan with the AI planner (Phase 3.1) and execute every task through the measured "
+                           "DeveloperAgent path")
     team.add_argument("--test-command", help="Command used to verify the integrated result (default: auto-detect)")
     team.add_argument("-y", "--yes", action="store_true",
                       help="Auto-approve LOW/MEDIUM-risk requests (never pushes, deploys, DB writes or secret use)")
@@ -193,10 +197,15 @@ def handle_team(args) -> int:
         console.print("[red]Give a goal, e.g. increscent team \"Create a simple task management application\"[/red]")
         return EXIT_CONFIG
 
+    planner_provider = None
     if args.simulate:
-        from .orchestration.simulation import simulated_provider_factory
+        from .orchestration.simulation import (SimulatedPlannerProvider, simulated_developer_factory,
+                                               simulated_provider_factory)
 
         factory, provider_name, model = simulated_provider_factory, "simulated", "simulated"
+        if args.ai_plan:
+            factory, model = simulated_developer_factory, "simulated-developer"
+            planner_provider = SimulatedPlannerProvider()
     else:
         try:
             resolved = resolve_provider_config(cli_provider=getattr(args, "provider", None),
@@ -214,9 +223,13 @@ def handle_team(args) -> int:
             return create_provider(dataclasses.replace(resolved, model=agent.model or resolved.model))
 
         provider_name, model = resolved.provider, resolved.model
+        if args.ai_plan:
+            planner_provider = create_provider(resolved)
 
+    max_attempts = args.max_attempts if args.max_attempts is not None else (1 if args.ai_plan else 3)
     config = OrchestratorConfig(provider=provider_name, model=model, max_parallel=max(1, args.parallel),
-                                max_attempts=max(1, args.max_attempts), test_command=args.test_command)
+                                max_attempts=max(1, max_attempts), test_command=args.test_command,
+                                executor="developer" if args.ai_plan else "agent")
     try:
         orch = Orchestrator(project.project_root, provider_factory=factory, config=config,
                             approval_handler=make_approval_handler(args.yes))
@@ -233,10 +246,22 @@ def handle_team(args) -> int:
             if graph is None:
                 console.print(f"[red]Unknown graph {args.resume}[/red]")
                 return EXIT_CONFIG
+            if graph.settings.get("plan"):  # created by the AI planner -> keep the developer executor
+                orch.config.executor = "developer"
+        elif args.ai_plan:
+            from .orchestration.ai_planner import Planner, PlanningError, plan_to_task_graph
+
+            try:
+                ai_plan = Planner(planner_provider, orch.profiles).create_plan(goal)
+            except PlanningError as e:
+                print(f"Planning failed: {e}", file=sys.stderr)
+                return EXIT_FAILURE
+            graph = plan_to_task_graph(ai_plan, orch, goal)
+            print(f"plan: {ai_plan.project_name}: " + " -> ".join(t.id for t in ai_plan.tasks), file=sys.stderr)
         else:
             plan = load_plan_file(args.plan) if args.plan else standard_plan(goal)
             graph = orch.create_graph(goal, plan)
-        print(f"graph: {graph.id}  provider: {provider_name}  model: {model}"
+        print(f"graph: {graph.id}  provider: {provider_name}  model: {model}  executor: {orch.config.executor}"
               + ("  (SIMULATION: offline scripted agents)" if args.simulate else ""), file=sys.stderr)
         summary = orch.run(graph.id)
     except (GitError, ValueError, KeyError) as e:
@@ -251,6 +276,8 @@ def handle_team(args) -> int:
         print(json.dumps(dataclasses.asdict(summary), indent=2))
     else:
         _print_tasks(console, orch.tasks.list(graph_id=graph.id))
+        if orch.config.executor == "developer":
+            print(render_task_results(orch.tasks.topological_order(graph.id)))
         console.print(f"\nGraph [bold]{graph.id}[/bold]: [bold]{summary.status}[/bold]")
         if summary.verification:
             v = summary.verification
@@ -260,6 +287,26 @@ def handle_team(args) -> int:
             console.print(f"Nothing was merged. Review with: increscent review {graph.id}   "
                           f"then approve the merge into the integration branch with --merge")
     return EXIT_OK if summary.status == "REVIEW" else EXIT_FAILURE
+
+
+def render_task_results(tasks) -> str:
+    """Measured per-task results (task, status, agent, worktree, files, tests, error)."""
+    lines = ["", "TASK RESULTS (measured)"]
+    for t in tasks:
+        if t.kind == "project":
+            continue
+        tests = t.tests or {}
+        test_text = (f"run {tests.get('run', 0)}, passed {tests.get('passed', 0)}, failed {tests.get('failed', 0)}"
+                     if tests else "none detected" if t.result else "not run")
+        lines += [
+            f"{t.id}  {t.title}  [{t.status.value}]",
+            f"  agent: {t.agent or '-'}   worktree: {t.worktree or '-'}",
+            f"  files: {', '.join(t.files_changed) or '-'}",
+            f"  tests: {test_text}",
+        ]
+        if t.error or t.blocked_reason:
+            lines.append(f"  error: {t.error or t.blocked_reason}")
+    return "\n".join(lines)
 
 
 def handle_plan(args) -> int:

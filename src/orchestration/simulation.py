@@ -16,7 +16,7 @@ import json
 import re
 import sys
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 from ..providers.base import BaseProvider, ChatResponse
 
@@ -306,19 +306,66 @@ def simulated_provider_factory(agent) -> SimulatedAgentProvider:
 _CREATE_FILE_TASK = re.compile(
     r"create\s+(?:a\s+)?(?:new\s+)?(?:file\s+)?(?:named\s+|called\s+)?[`'\"]?(?P<path>[\w.\-/\\]+\.\w+)[`'\"]?\s+"
     r"(?:containing|with)\s+(?:the\s+)?(?:text|content|contents)?\s*"
-    r"(?:[`'\"“](?P<quoted>.+?)[`'\"”]|(?P<bare>[^\n]+?))\s*\.?\s*$",
+    r"(?:[`'\"\u201c](?P<quoted>.+?)[`'\"\u201d]|(?P<bare>[^\n]+?))\s*\.?\s*$",
     re.IGNORECASE | re.MULTILINE,
+)
+# "Create a file named X containing the contents of Y followed by the text 'Z'."  (depends on Y existing)
+_DERIVED_FILE_TASK = re.compile(
+    r"create\s+(?:a\s+)?(?:file\s+)?(?:named\s+)?[`'\"]?(?P<path>[\w.\-/\\]+\.\w+)[`'\"]?\s+containing\s+the\s+contents\s+of\s+"
+    r"[`'\"]?(?P<source>[\w.\-/\\]+\.\w+)[`'\"]?\s+followed\s+by\s+(?:the\s+)?(?:text\s+)?[`'\"\u201c](?P<extra>.+?)[`'\"\u201d]",
+    re.IGNORECASE,
+)
+# "Verify that X contains the text 'Y'."  (read-only; runs the existing tests)
+_VERIFY_TASK = re.compile(
+    r"verify\s+that\s+[`'\"]?(?P<path>[\w.\-/\\]+\.\w+)[`'\"]?\s+contains\s+(?:the\s+)?(?:text\s+)?"
+    r"[`'\"\u201c](?P<text>.+?)[`'\"\u201d]",
+    re.IGNORECASE,
 )
 
 
-class SimulatedDeveloperProvider(BaseProvider):
-    """Scripted developer for ONE kind of task: "Create a file named X containing 'Y'".
+def parse_simulated_task(text: str) -> tuple[str, dict[str, str]] | None:
+    """The task forms the simulated developer can execute (checked in this order)."""
+    m = _DERIVED_FILE_TASK.search(text)
+    if m:
+        return "derive", {"path": m.group("path").replace("\\", "/"), "source": m.group("source").replace("\\", "/"),
+                          "extra": m.group("extra")}
+    m = _VERIFY_TASK.search(text)
+    if m:
+        return "verify", {"path": m.group("path").replace("\\", "/"), "text": m.group("text")}
+    m = _CREATE_FILE_TASK.search(text)
+    if m:
+        value = m.group("quoted") if m.group("quoted") is not None else m.group("bare").strip()
+        return "create", {"path": m.group("path").replace("\\", "/"), "text": value}
+    return None
 
-    It issues real tool calls (Glob, Write, Bash, ReportResult) through the normal
-    agent loop and reacts to the actual tool results: it reads the pytest output
-    and fixes the file once if the test fails. ``inject_bug`` writes wrong content
-    first (to exercise the fix path); ``unfixable`` never fixes it (to exercise
-    the failure path). It is not an AI and cannot do any other task.
+
+def _read_tool_text(message: dict | None) -> Optional[str]:
+    """File text from a Read tool result (line numbers stripped), or None if the read failed."""
+    if not message:
+        return None
+    try:
+        data = json.loads(message.get("content") or "")
+    except Exception:
+        return None
+    file = data.get("file") if isinstance(data, dict) else None
+    if not isinstance(file, dict) or "content" not in file:
+        return None
+    return "\n".join(re.sub(r"^\d+\t", "", line) for line in str(file["content"]).splitlines())
+
+
+class SimulatedDeveloperProvider(BaseProvider):
+    """Scripted developer for three deterministic task forms:
+
+    * ``Create a file named X containing 'Y'``
+    * ``Create a file named X containing the contents of Y followed by the text 'Z'``. It reads Y,
+      which a previous task must have produced, and fails honestly if Y is missing.
+    * ``Verify that X contains the text 'Y'``. Read-only; runs the existing tests.
+
+    It issues real tool calls (Glob, Read, Write, Bash, ReportResult) through the normal agent loop
+    and reacts to their actual results. It also respects the tools its profile offers: no Bash means
+    no local test run, and no Write means it reports failure instead of writing.
+    ``inject_bug``/``unfixable`` apply to the first form and exercise the fix and failure paths.
+    It is not an AI and cannot do any other task.
     """
 
     message_format = "openai"
@@ -331,6 +378,7 @@ class SimulatedDeveloperProvider(BaseProvider):
         self.unfixable = unfixable
         self.step = 0
         self.fixed = False
+        self.verified: Optional[bool] = None
 
     def _call(self, name: str, tool_input: dict[str, Any]) -> ChatResponse:
         self.step += 1
@@ -340,51 +388,118 @@ class SimulatedDeveloperProvider(BaseProvider):
     def _report(self, **fields: Any) -> ChatResponse:
         return self._call("ReportResult", fields)
 
+    @staticmethod
+    def _test_rel(rel: str) -> str:
+        return f"tests/test_{re.sub(r'[^A-Za-z0-9]+', '_', Path(rel).stem).strip('_').lower() or 'file'}_content.py"
+
+    @staticmethod
+    def _run_cmd(test_rel: str | None = None) -> str:
+        return f'"{sys.executable}" -m pytest -q -p no:cacheprovider' + (f" {test_rel}" if test_rel else "")
+
     def chat(self, messages, tools=None, **kwargs) -> ChatResponse:
         messages = list(messages)
+        offered = {t.get("name") for t in (tools or []) if isinstance(t, dict)}
+        self.can_run = not offered or "Bash" in offered
+        self.can_write = not offered or "Write" in offered
         assignment = next((m.get("content") or "" for m in messages if m.get("role") == "user"), "")
         task_text = assignment.split("## Task", 1)[-1].split("##", 1)[0]
-        match = _CREATE_FILE_TASK.search(task_text)
         last_tool = next((m for m in reversed(messages) if m.get("role") == "tool"), None)
-        if last_tool and last_tool.get("tool_call_id", "").startswith("sim_dev_") and '"recorded": true' in (last_tool.get("content") or ""):
+        if last_tool and last_tool.get("tool_call_id", "").startswith("sim_dev_") \
+                and '"recorded": true' in (last_tool.get("content") or ""):
             return ChatResponse(content="Done.", model=self.model or "", usage={}, finish_reason="stop")
-        if match is None:
+        parsed = parse_simulated_task(task_text)
+        if parsed is None:
             if self.step:
                 return ChatResponse(content="Done.", model=self.model or "", usage={}, finish_reason="stop")
-            return self._report(status="failed", summary="The simulated developer only supports tasks of the form "
-                                "\"Create a file named X containing 'Y'\".", next_action="Use a real model provider.")
-        rel = match.group("path").replace("\\", "/")
-        text = match.group("quoted") if match.group("quoted") is not None else match.group("bare").strip()
-        target = self.cwd / rel
-        test_rel = f"tests/test_{re.sub(r'[^A-Za-z0-9]+', '_', Path(rel).stem).strip('_').lower() or 'file'}_content.py"
-        py = f'"{sys.executable}"'
-        run_cmd = f"{py} -m pytest -q -p no:cacheprovider {test_rel}"
+            return self._report(status="failed", summary="The simulated developer only supports: \"Create a file "
+                                "named X containing 'Y'\", \"... containing the contents of Y followed by the text 'Z'\" "
+                                "and \"Verify that X contains the text 'Y'\".", next_action="Use a real model provider.")
+        kind, p = parsed
+        if kind != "verify" and not self.can_write:
+            return self._report(status="failed", summary=f"This profile cannot write files (task needs {p['path']}).")
+        return getattr(self, f"_{kind}")(p, messages, last_tool)
 
-        if self.step == 0:  # 1. inspect the workspace
+    # -- "create X containing 'Y'" -------------------------------------------------------
+    def _create(self, p, messages, last_tool) -> ChatResponse:
+        rel, text = p["path"], p["text"]
+        target, test_rel = self.cwd / rel, self._test_rel(rel)
+        if self.step == 0:  # inspect the workspace
             return self._call("Glob", {"pattern": "**/*", "path": str(self.cwd)})
-        if self.step == 1:  # 2. implement (optionally with an injected bug)
-            content = text.upper() if self.inject_bug else text
-            return self._call("Write", {"file_path": str(target), "content": content + "\n"})
-        if self.step == 2:  # 3. add a test for the acceptance criterion
-            depth = len(Path(test_rel).parent.parts)
+        if self.step == 1:  # implement (optionally with an injected bug)
+            return self._call("Write", {"file_path": str(target),
+                                        "content": (text.upper() if self.inject_bug else text) + "\n"})
+        if self.step == 2:  # a test for the acceptance criterion
             return self._call("Write", {"file_path": str(self.cwd / test_rel), "content": (
                 "from pathlib import Path\n\n\n"
                 f"def test_{Path(test_rel).stem[5:]}():\n"
-                f"    root = Path(__file__).resolve().parents[{depth}]\n"
+                "    root = Path(__file__).resolve().parents[1]\n"
                 f"    assert (root / {rel!r}).read_text(encoding=\"utf-8\").strip() == {text!r}\n")})
-        if self.step == 3:  # 4. run the tests
-            return self._call("Bash", {"command": run_cmd, "timeout_s": 300})
+        if not self.can_run:
+            return self._finish(rel, test_rel, ran=False)
+        if self.step == 3:
+            return self._call("Bash", {"command": self._run_cmd(test_rel), "timeout_s": 300})
         counts = _last_tests(messages)
-        if counts[2] > 0 and not self.fixed and not self.unfixable:  # 5. inspect the failure and fix
+        if counts[2] > 0 and not self.fixed and not self.unfixable:  # inspect the failure, fix it
             self.fixed = True
             return self._call("Write", {"file_path": str(target), "content": text + "\n"})
-        if self.fixed and self.step == 5:  # 6. re-run after the fix
-            return self._call("Bash", {"command": run_cmd, "timeout_s": 300})
-        ok = counts[2] == 0 and counts[0] > 0
+        if self.fixed and self.step == 5:  # re-run after the fix
+            return self._call("Bash", {"command": self._run_cmd(test_rel), "timeout_s": 300})
+        return self._finish(rel, test_rel, ran=True, messages=messages)
+
+    # -- "create X containing the contents of Y followed by 'Z'" ---------------------------------
+    def _derive(self, p, messages, last_tool) -> ChatResponse:
+        rel, source, extra = p["path"], p["source"], p["extra"]
+        test_rel = self._test_rel(rel)
+        if self.step == 0:  # inspect the previous task's output
+            return self._call("Read", {"file_path": str(self.cwd / source)})
+        if self.step == 1:
+            content = _read_tool_text(last_tool)
+            if content is None:
+                return self._report(status="failed", summary=f"{source} does not exist: the dependency's output is "
+                                    "missing, so the dependent change cannot be made.",
+                                    next_action="Run the task that produces it first.")
+            return self._call("Write", {"file_path": str(self.cwd / rel),
+                                        "content": content.rstrip("\n") + "\n" + extra + "\n"})
+        if self.step == 2:
+            return self._call("Write", {"file_path": str(self.cwd / test_rel), "content": (
+                "from pathlib import Path\n\n\n"
+                f"def test_{Path(test_rel).stem[5:]}():\n"
+                "    root = Path(__file__).resolve().parents[1]\n"
+                f"    expected = (root / {source!r}).read_text(encoding=\"utf-8\").rstrip(\"\\n\") + \"\\n\" + {extra!r}\n"
+                f"    assert (root / {rel!r}).read_text(encoding=\"utf-8\").strip() == expected.strip()\n")})
+        if not self.can_run:
+            return self._finish(rel, test_rel, ran=False)
+        if self.step == 3:
+            return self._call("Bash", {"command": self._run_cmd(test_rel), "timeout_s": 300})
+        return self._finish(rel, test_rel, ran=True, messages=messages)
+
+    # -- "verify that X contains 'Y'" (read-only) ---------------------------------------------
+    def _verify(self, p, messages, last_tool) -> ChatResponse:
+        rel, text = p["path"], p["text"]
+        if self.step == 0:
+            return self._call("Read", {"file_path": str(self.cwd / rel)})
+        if self.step == 1:
+            content = _read_tool_text(last_tool)
+            self.verified = content is not None and text in content
+            if self.can_run:
+                return self._call("Bash", {"command": self._run_cmd(), "timeout_s": 300})
+        counts = _last_tests(messages) if self.can_run else (0, 0, 0)
+        ok = bool(self.verified) and counts[2] == 0
         return self._report(
             status="completed" if ok else "failed",
-            summary=(f"Created {rel} with the requested text and a test that verifies it."
-                     if ok else f"Could not make the test for {rel} pass."),
+            summary=(f"Verified that {rel} contains the expected text; existing tests pass." if ok
+                     else f"Verification of {rel} failed (text present: {self.verified}, failing tests: {counts[2]})."),
+            tests_run=counts[0], tests_passed=counts[1], tests_failed=counts[2],
+            review_verdict="approve" if ok else "request_changes",
+            next_action="Human review." if ok else "Fix the upstream task.",
+        )
+
+    def _finish(self, rel: str, test_rel: str, *, ran: bool, messages=None) -> ChatResponse:
+        counts = _last_tests(messages) if ran else (0, 0, 0)
+        ok = not ran or (counts[2] == 0 and counts[0] > 0)
+        return self._report(
+            status="completed" if ok else "failed",
+            summary=(f"Created {rel} and a test that verifies it." if ok else f"Could not make the test for {rel} pass."),
             files_changed=[rel, test_rel], tests_run=counts[0], tests_passed=counts[1], tests_failed=counts[2],
             next_action="Review the change." if ok else "Investigate the failing test.",
         )
@@ -433,22 +548,22 @@ SIMULATED_PLAN: dict[str, Any] = {
     ],
     "tasks": [
         {"id": "architecture", "title": "Design the architecture", "role": "architect", "dependencies": [],
-         "description": "Define modules, data model and API boundaries.",
+         "description": "Create a file named docs/ARCHITECTURE.md containing the text 'Task Manager: users, projects, tasks with priorities, and a dashboard'.",
          "acceptance_criteria": ["docs/ARCHITECTURE.md covers modules, data model and API"]},
         {"id": "database", "title": "Implement the data model", "role": "database", "dependencies": ["architecture"],
-         "description": "Users, projects and tasks tables with a repository layer.",
+         "description": "Create a file named app/schema.txt containing the contents of docs/ARCHITECTURE.md followed by the text 'Tables: users, projects, tasks (title, status, priority)'.",
          "acceptance_criteria": ["Schema covers users, projects, tasks and priority"]},
         {"id": "backend", "title": "Implement the backend API", "role": "backend", "dependencies": ["database"],
-         "description": "Auth, project and task endpoints with validation.",
+         "description": "Create a file named app/api.txt containing the contents of app/schema.txt followed by the text 'Endpoints: /users /projects /tasks'.",
          "acceptance_criteria": ["CRUD endpoints for projects and tasks", "Invalid input is rejected"]},
         {"id": "frontend", "title": "Implement the frontend and dashboard", "role": "frontend",
-         "dependencies": ["backend"], "description": "Pages for projects, tasks and the dashboard.",
+         "dependencies": ["backend"], "description": "Create a file named app/dashboard.txt containing the contents of app/api.txt followed by the text 'Pages: projects, tasks, dashboard'.",
          "acceptance_criteria": ["Dashboard shows open tasks per project and priority"]},
         {"id": "tests", "title": "Write integration tests", "role": "qa", "dependencies": ["frontend"],
-         "description": "End-to-end tests of the main user flows.",
+         "description": "Create a file named app/test-report.txt containing the contents of app/dashboard.txt followed by the text 'Verified: main flows covered'.",
          "acceptance_criteria": ["Main flows are covered and pass"]},
         {"id": "review", "title": "Review the changes", "role": "reviewer", "dependencies": ["tests"],
-         "description": "Review correctness, tests and risks.",
+         "description": "Verify that app/test-report.txt contains the text 'Verified: main flows covered'.",
          "acceptance_criteria": ["Approve or request changes with findings"]},
     ],
 }

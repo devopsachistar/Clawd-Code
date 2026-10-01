@@ -46,6 +46,9 @@ class OrchestratorConfig:
     max_attempts: int = 3            # first attempt + retries
     test_command: Optional[str] = None
     run_verification: bool = True
+    # "agent": Phase 2 path (runner + _verify_and_commit).
+    # "developer": Phase 3.2 path: each task runs through DeveloperAgent.execute() (measured files/tests).
+    executor: str = "agent"
 
 
 @dataclass
@@ -197,6 +200,9 @@ class Orchestrator:
         try:
             worktree = self._prepare_worktree(task, graph)
             lock = self.worktrees.acquire(worktree.name, owner=task.id)
+            if self.config.executor == "developer":
+                self._execute_with_developer(self.tasks.require(task.id), graph, profile, worktree)
+                return
             agent = self.runner.create_agent(profile, task_id=task.id, working_directory=worktree.path,
                                              provider=self.config.provider, model=self.config.model,
                                              attempt=task.attempts)
@@ -219,6 +225,50 @@ class Orchestrator:
         finally:
             if lock is not None:
                 lock.release()
+
+    def _execute_with_developer(self, task: Task, graph: TaskGraph, profile, worktree) -> None:
+        """Run one graph task through DeveloperAgent (measured result), commit it, record it."""
+        from ..agents.developer import DeveloperAgent
+
+        self.tasks.mutate(task.id, lambda t: (setattr(t, "worktree", worktree.name), setattr(t, "branch", worktree.branch)))
+        description = task.description
+        deps = [self.tasks.require(d) for d in task.dependencies]
+        if deps:
+            description += "\n\nCompleted dependencies (their committed changes are in your workspace):\n" + "\n".join(
+                f"- {d.title}: {(d.result or {}).get('summary', '')} Files: {', '.join(d.files_changed) or '-'}"
+                for d in deps)
+        spec = TaskSpec(key=task.id, title=task.title, description=description, profile=profile.name)
+        self.bus.send(AgentMessage(type=MessageType.TASK_ASSIGNMENT, sender=ORCHESTRATOR, recipient=f"agent:{task.id}",
+                                   content=task.title, task_id=task.id,
+                                   payload={"worktree": worktree.path, "branch": worktree.branch,
+                                            "attempt": task.attempts, "profile": profile.name, "executor": "developer"}))
+        developer = DeveloperAgent(None, runner=self.runner, profiles=self.profiles, profile=profile.name,
+                                   provider=self.config.provider, model=self.config.model,
+                                   test_command=self.config.test_command)
+        measured = developer.execute(spec, worktree.path, should_cancel=self._cancel.is_set)
+        tests = ({"command": measured.test_command, "run": measured.tests_run, "passed": measured.tests_passed,
+                  "failed": measured.tests_failed, "output_tail": measured.test_output}
+                 if measured.test_command else {})
+        self.tasks.mutate(task.id, lambda t: (setattr(t, "agent", measured.agent_id), setattr(t, "tests", tests)))
+
+        commit = None
+        if measured.status == "completed" and profile.commits and measured.files_changed:
+            try:  # dependents' worktrees are created from this branch
+                commit = self.worktrees.commit(worktree.name, f"{task.title}\n\nTask: {task.id}\n"
+                                                              f"Agent: {measured.agent_id} ({profile.name})")
+            except GitError as e:
+                measured.status, measured.error = "failed", str(e)
+        result = AgentResult(
+            task_id=task.id, agent_id=measured.agent_id or "", status=measured.status, summary=measured.summary,
+            files_changed=list(measured.files_changed), tests_run=measured.tests_run,
+            tests_passed=measured.tests_passed, tests_failed=measured.tests_failed, warnings=list(measured.warnings),
+            commit=commit, error=measured.error, reported_by_agent=measured.agent_reported_status is not None,
+        )
+        agent = self.agents.get(measured.agent_id) if measured.agent_id else None
+        if agent is None:
+            self._record_failure(task.id, None, result, measured.error or "developer agent did not run")
+            return
+        self._record_result(task.id, agent, result)
 
     def _prepare_worktree(self, task: Task, graph: TaskGraph):
         deps = [self.tasks.require(d) for d in task.dependencies]
