@@ -592,3 +592,92 @@ class SimulatedPlannerProvider(BaseProvider):
 
     def get_available_models(self) -> list[str]:
         return ["simulated-planner"]
+
+
+# ---------------------------------------------------------------------------
+# QA diagnosis (Phase 3.3.1): deterministic offline diagnosis of pytest failures
+# ---------------------------------------------------------------------------
+
+_PYTEST_SECTION = re.compile(r"^_{3,} (?P<name>\S+) _{3,}$", re.M)
+_ASSERT_EQ = re.compile(r"^assert (?P<actual>.+?) == (?P<expected>.+)$")
+_WHERE_CALL = re.compile(r"where (?P<value>.+?) = (?P<call>(?P<func>[\w.]+)\(.*\))")
+_RAISED = re.compile(r"^(?P<exc>\w+(?:Error|Exception)): (?P<message>.+)$")
+
+
+class SimulatedQAProvider(BaseProvider):
+    """Deterministic offline QA model. It reads the test output in the diagnosis request and explains
+    ``assert X == Y`` failures and raised exceptions, quoting the output verbatim as evidence.
+    It answers ``inconclusive`` when it recognises nothing. It has no tools and cannot touch files.
+    It records the requests it receives so tests can check them.
+    """
+
+    message_format = "openai"
+
+    def __init__(self, model: str = "simulated-qa"):
+        super().__init__(api_key="simulated", base_url=None, model=model)
+        self.requests: list[list[dict[str, Any]]] = []
+
+    @staticmethod
+    def _test_output(messages) -> str:
+        content = next((m.get("content") or "" for m in messages if m.get("role") == "user"), "")
+        m = re.search(r"## Test output\n```\n(.*?)\n```", content, re.S)
+        return m.group(1).replace("\r\n", "\n") if m else ""
+
+    @staticmethod
+    def _explain(test: str, short_error: str, lines: list[str]) -> tuple[dict[str, str], str, bool] | None:
+        """(failure, recommended fix, confident) for one failing test, from its ``E`` lines."""
+        for i, line in enumerate(lines):
+            m = _ASSERT_EQ.match(line)
+            if m:
+                actual, expected = m.group("actual"), m.group("expected")
+                where = next((_WHERE_CALL.search(x) for x in lines[i + 1:] if _WHERE_CALL.search(x)), None)
+                fix = (f"Correct the implementation of {where.group('func')}() so {where.group('call')} returns "
+                       f"{expected} instead of {actual}." if where else
+                       f"Correct the implementation so the test receives {expected} instead of {actual}.")
+                return ({"test": test, "error": f"expected {expected}, received {actual}",
+                         "likely_cause": "the implementation returns an incorrect result", "evidence": line}, fix, True)
+        for line in lines:
+            m = _RAISED.match(line)
+            if m:
+                return ({"test": test, "error": line, "likely_cause": f"the code raises {m.group('exc')}",
+                         "evidence": line}, f"Fix the code path that raises {m.group('exc')}: {m.group('message')}", True)
+        if short_error:
+            return ({"test": test, "error": short_error, "likely_cause": "the test failed; the output gives no detail",
+                     "evidence": short_error}, f"Inspect {test} and the code it exercises.", False)
+        return None
+
+    def chat(self, messages, tools=None, **kwargs) -> ChatResponse:
+        from ..agents.qa import failed_tests
+
+        self.requests.append(list(messages))
+        output = self._test_output(messages)
+        sections: dict[str, list[str]] = {}
+        marks = list(_PYTEST_SECTION.finditer(output))
+        for i, m in enumerate(marks):
+            body = output[m.end(): marks[i + 1].start() if i + 1 < len(marks) else len(output)]
+            sections[m.group("name").split(".")[-1]] = [re.sub(r"^E\s+", "", x).strip()
+                                                         for x in body.splitlines() if x.startswith("E ")]
+        failures, fixes, confident = [], [], True
+        for test, short_error in failed_tests(output):
+            explained = self._explain(test, short_error, sections.get(test.split("::")[-1], []))
+            if explained:
+                failures.append(explained[0])
+                fixes.append(explained[1])
+                confident = confident and explained[2]
+        if failures:
+            diagnosis = {"status": "diagnosed",
+                         "summary": f"{len(failures)} failing test(s): " + "; ".join(
+                             f"{f['test'].split('::')[-1]} ({f['error']})" for f in failures),
+                         "failures": failures, "recommended_fixes": fixes,
+                         "confidence": "high" if confident else "low"}
+        else:
+            diagnosis = {"status": "inconclusive", "summary": "No recognisable test failure in the output.",
+                         "failures": [], "recommended_fixes": [], "confidence": "low"}
+        return ChatResponse(content=json.dumps(diagnosis), model=self.model or "simulated-qa", usage={},
+                            finish_reason="stop")
+
+    def chat_stream(self, messages, tools=None, **kwargs):
+        yield self.chat(messages, tools=tools, **kwargs).content
+
+    def get_available_models(self) -> list[str]:
+        return ["simulated-qa"]

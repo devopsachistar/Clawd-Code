@@ -58,6 +58,14 @@ def add_team_commands(subparsers: argparse._SubParsersAction, add_common) -> Non
     develop.add_argument("--cwd", help="Project directory (default: current directory)")
     add_common(develop, suppress=True)
 
+    qa = subparsers.add_parser("qa", help="Diagnose a failed task (read-only QA diagnosis; no repair)")
+    qa.add_argument("task_id", help="Id of a failed task (see: increscent tasks)")
+    qa.add_argument("--simulate", action="store_true",
+                    help="Use the deterministic offline QA model (explains pytest assertion/exception failures)")
+    qa.add_argument("--json", action="store_true", help="Print the structured diagnosis as JSON")
+    qa.add_argument("--cwd", help="Project directory (default: current directory)")
+    add_common(qa, suppress=True)
+
     agents = subparsers.add_parser("agents", help="List agents")
     agents.add_argument("--graph", help="Only agents of this graph")
     agents.add_argument("--cwd")
@@ -483,6 +491,76 @@ def handle_develop(args) -> int:
     return EXIT_OK if result.status == "completed" else EXIT_FAILURE
 
 
+def qa_input_from_task(task, workspace: str = ""):
+    """A recorded graph task -> the (TaskSpec, DeveloperResult) the QA diagnoser takes."""
+    from .agents.developer import DeveloperResult
+    from .orchestration.planner import TaskSpec
+
+    result, tests = task.result or {}, task.tests or {}
+    spec = TaskSpec(key=task.id, title=task.title, description=task.description, profile=task.profile or "Developer")
+    measured = DeveloperResult(
+        status="completed" if task.status.value == "COMPLETED" else "failed", task_id=task.id,
+        summary=result.get("summary", ""), files_changed=list(task.files_changed or result.get("files_changed") or []),
+        tests_run=int(tests.get("run", 0)), tests_passed=int(tests.get("passed", 0)),
+        tests_failed=int(tests.get("failed", 0)), error=task.error or result.get("error"), workspace=workspace,
+        test_command=tests.get("command"), test_output=tests.get("output_tail") or "", agent_id=task.agent)
+    return spec, measured
+
+
+def render_diagnosis(diagnosis) -> str:
+    lines = [f"QA DIAGNOSIS  {diagnosis.task_id}", "", "STATUS", f"  {diagnosis.status}  (confidence: "
+             f"{diagnosis.confidence})", "", "SUMMARY", f"  {diagnosis.summary}"]
+    for f in diagnosis.failures:
+        lines += ["", f"FAILURE  {f.test}", f"  error:    {f.error}", f"  cause:    {f.likely_cause}",
+                  f"  evidence: {f.evidence}"]
+    if diagnosis.recommended_fixes:
+        lines += ["", "RECOMMENDED FIXES"] + [f"  - {x}" for x in diagnosis.recommended_fixes]
+    lines += [f"  warning: {w}" for w in diagnosis.warnings]
+    lines += ["", "Diagnosis only: nothing was changed."]
+    return "\n".join(lines)
+
+
+def handle_qa(args) -> int:
+    """Failed task (TaskStore) -> QADiagnoser (one provider call, no tools) -> structured diagnosis."""
+    from .agents.qa import QADiagnoser
+    from .config import ConfigError, create_provider, missing_api_key_message, resolve_provider_config
+    from .gitops.worktrees import GitError, WorktreeManager
+    from .taskgraph.store import TaskGraphError, TaskStore
+
+    state = _state(args)
+    try:
+        task = TaskStore(state).require(args.task_id)
+    except TaskGraphError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return EXIT_CONFIG
+    workspace = ""
+    if task.worktree:
+        try:
+            workspace = WorktreeManager(_project(args), state_dir=state).get(task.worktree).path
+        except GitError:
+            workspace = task.worktree
+    if args.simulate:
+        from .orchestration.simulation import SimulatedQAProvider
+
+        provider = SimulatedQAProvider()
+    else:
+        try:
+            resolved = resolve_provider_config(cli_provider=getattr(args, "provider", None),
+                                               cli_model=getattr(args, "model", None),
+                                               cli_base_url=getattr(args, "base_url", None),
+                                               project_root=_project(args))
+            if not resolved.has_api_key:
+                print(f"Error: {missing_api_key_message(resolved)}", file=sys.stderr)
+                return EXIT_CONFIG
+            provider = create_provider(resolved)
+        except (ConfigError, ImportError) as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return EXIT_CONFIG
+    diagnosis = QADiagnoser(provider).diagnose(*qa_input_from_task(task, workspace))
+    print(json.dumps(diagnosis.to_dict(), indent=2) if args.json else render_diagnosis(diagnosis))
+    return EXIT_OK if diagnosis.status == "diagnosed" else EXIT_FAILURE
+
+
 def render_plan(plan, graph=None) -> str:
     lines = ["PROJECT", f"  {plan.project_name}", "", "SUMMARY", f"  {plan.summary}", "", "REQUIREMENTS"]
     lines += [f"  - {r}" for r in plan.requirements]
@@ -672,6 +750,7 @@ HANDLERS = {
     "team": handle_team,
     "plan": handle_plan,
     "develop": handle_develop,
+    "qa": handle_qa,
     "tasks": handle_tasks,
     "task": handle_task,
     "agents": handle_agents,
