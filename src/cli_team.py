@@ -29,6 +29,9 @@ def add_team_commands(subparsers: argparse._SubParsersAction, add_common) -> Non
     team.add_argument("--ai-plan", action="store_true",
                       help="Plan with the AI planner (Phase 3.1) and execute every task through the measured "
                            "DeveloperAgent path")
+    team.add_argument("--max-repairs", type=int, default=0, metavar="N",
+                      help="With --ai-plan: after a measured failure, QA diagnoses it and the developer repairs it "
+                           "in the same worktree, up to N times (max 2; default 0 = no repair loop)")
     team.add_argument("--test-command", help="Command used to verify the integrated result (default: auto-detect)")
     team.add_argument("-y", "--yes", action="store_true",
                       help="Auto-approve LOW/MEDIUM-risk requests (never pushes, deploys, DB writes or secret use)")
@@ -165,7 +168,7 @@ def make_approval_handler(auto_approve: bool, *, err=None):
 _PROGRESS_EVENTS = {
     "graph.planned", "task.started", "task.completed", "task.retry", "task.failed", "task.blocked",
     "agent.waiting", "approval.approved", "approval.denied", "worktree.created", "commit.created",
-    "tests.run", "review.requested", "graph.finished",
+    "tests.run", "review.requested", "graph.finished", "qa.diagnosed", "task.repair",
 }
 
 
@@ -205,15 +208,25 @@ def handle_team(args) -> int:
         console.print("[red]Give a goal, e.g. increscent team \"Create a simple task management application\"[/red]")
         return EXIT_CONFIG
 
-    planner_provider = None
+    from .orchestration.orchestrator import MAX_REPAIRS
+
+    if not 0 <= args.max_repairs <= MAX_REPAIRS:
+        console.print(f"[red]--max-repairs must be between 0 and {MAX_REPAIRS}[/red]")
+        return EXIT_CONFIG
+    if args.max_repairs and not (args.ai_plan or args.resume):
+        console.print("[red]--max-repairs needs --ai-plan (the DeveloperAgent execution path)[/red]")
+        return EXIT_CONFIG
+    planner_provider = qa_factory = None
     if args.simulate:
         from .orchestration.simulation import (SimulatedPlannerProvider, simulated_developer_factory,
                                                simulated_provider_factory)
 
         factory, provider_name, model = simulated_provider_factory, "simulated", "simulated"
         if args.ai_plan:
+            from .orchestration.simulation import simulated_qa_factory
+
             factory, model = simulated_developer_factory, "simulated-developer"
-            planner_provider = SimulatedPlannerProvider()
+            planner_provider, qa_factory = SimulatedPlannerProvider(), simulated_qa_factory
     else:
         try:
             resolved = resolve_provider_config(cli_provider=getattr(args, "provider", None),
@@ -237,10 +250,10 @@ def handle_team(args) -> int:
     max_attempts = args.max_attempts if args.max_attempts is not None else (1 if args.ai_plan else 3)
     config = OrchestratorConfig(provider=provider_name, model=model, max_parallel=max(1, args.parallel),
                                 max_attempts=max(1, max_attempts), test_command=args.test_command,
-                                executor="developer" if args.ai_plan else "agent")
+                                executor="developer" if args.ai_plan else "agent", max_repairs=args.max_repairs)
     try:
         orch = Orchestrator(project.project_root, provider_factory=factory, config=config,
-                            approval_handler=make_approval_handler(args.yes))
+                            approval_handler=make_approval_handler(args.yes), qa_provider_factory=qa_factory)
     except GitError as e:
         console.print(f"[red]{e}[/red]")
         return EXIT_CONFIG
@@ -312,9 +325,30 @@ def render_task_results(tasks) -> str:
             f"  files: {', '.join(t.files_changed) or '-'}",
             f"  tests: {test_text}",
         ]
+        lines += render_attempt_log((t.result or {}).get("attempt_log") or [])
         if t.error or t.blocked_reason:
             lines.append(f"  error: {t.error or t.blocked_reason}")
     return "\n".join(lines)
+
+
+def render_attempt_log(log: list[dict]) -> list[str]:
+    """Developer -> QA -> repair steps of one task (OrchestratorConfig.max_repairs > 0)."""
+    lines = []
+    for step in log:
+        if step.get("step") == "developer":
+            t = step.get("tests") or {}
+            if step.get("repair"):
+                lines.append(f"  Repair: attempt {step['attempt']}")
+            claim = f"; agent claimed {step['agent_claimed']}" if step.get("agent_claimed") else ""
+            lines.append(f"  Attempt {step['attempt']}: {str(step['status']).upper()}  (tests run {t.get('run', 0)}, "
+                         f"passed {t.get('passed', 0)}, failed {t.get('failed', 0)}{claim})")
+        elif step.get("step") == "qa":
+            lines.append(f"  QA: {step['status']} ({step['confidence']}): {step['summary']}")
+            lines += [f"      cause: {f['likely_cause']}; evidence: {f['evidence']}" for f in step.get("failures", [])]
+            lines += [f"      fix: {x}" for x in step.get("recommended_fixes", [])]
+        elif step.get("step") == "final":
+            lines.append(f"  RESULT: {step['status']} after {step['repairs']} repair(s)")
+    return lines
 
 
 def handle_plan(args) -> int:

@@ -34,6 +34,9 @@ from ..orchestration.testing import detect_test_command, run_tests
 from .profiles import ProfileRegistry
 from .runner import AgentRunner, ApprovalHandler, ProviderFactory
 
+# Heading that starts the repair context appended to a TaskSpec by the orchestrator's repair loop.
+REPAIR_MARKER = "## REPAIR ATTEMPT"
+
 _SNAPSHOT_SKIP_DIRS = {".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "node_modules", ".venv",
                        "venv", ".tox"}
 

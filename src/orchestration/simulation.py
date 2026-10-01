@@ -315,6 +315,14 @@ _DERIVED_FILE_TASK = re.compile(
     r"[`'\"]?(?P<source>[\w.\-/\\]+\.\w+)[`'\"]?\s+followed\s+by\s+(?:the\s+)?(?:text\s+)?[`'\"\u201c](?P<extra>.+?)[`'\"\u201d]",
     re.IGNORECASE,
 )
+# "Create a function F(a, b) in X.py that returns a OP b."  (first attempt is deliberately wrong; see
+# SimulatedDeveloperProvider; it is fixed only in a repair attempt that carries a QA diagnosis)
+_FUNCTION_TASK = re.compile(
+    r"create\s+a\s+function\s+(?P<func>[A-Za-z_]\w*)\(a,\s*b\)\s+in\s+[`'\"]?(?P<path>[\w.\-/\\]+\.py)[`'\"]?"
+    r"\s+that\s+returns\s+a\s*(?P<op>[-+*])\s*b",
+    re.IGNORECASE,
+)
+_WRONG_OP = {"+": "-", "-": "+", "*": "+"}
 # "Verify that X contains the text 'Y'."  (read-only; runs the existing tests)
 _VERIFY_TASK = re.compile(
     r"verify\s+that\s+[`'\"]?(?P<path>[\w.\-/\\]+\.\w+)[`'\"]?\s+contains\s+(?:the\s+)?(?:text\s+)?"
@@ -329,6 +337,9 @@ def parse_simulated_task(text: str) -> tuple[str, dict[str, str]] | None:
     if m:
         return "derive", {"path": m.group("path").replace("\\", "/"), "source": m.group("source").replace("\\", "/"),
                           "extra": m.group("extra")}
+    m = _FUNCTION_TASK.search(text)
+    if m:
+        return "function", {"path": m.group("path").replace("\\", "/"), "func": m.group("func"), "op": m.group("op")}
     m = _VERIFY_TASK.search(text)
     if m:
         return "verify", {"path": m.group("path").replace("\\", "/"), "text": m.group("text")}
@@ -360,6 +371,10 @@ class SimulatedDeveloperProvider(BaseProvider):
     * ``Create a file named X containing the contents of Y followed by the text 'Z'``. It reads Y,
       which a previous task must have produced, and fails honestly if Y is missing.
     * ``Verify that X contains the text 'Y'``. Read-only; runs the existing tests.
+    * ``Create a function F(a, b) in X.py that returns a OP b``. It scripts the repair loop: the first
+      attempt uses the wrong operator, writes a correct test and claims success without running it.
+      In a repair attempt (``## REPAIR ATTEMPT`` plus a QA diagnosis naming ``F()``) it reads the file
+      and fixes it. With ``unfixable`` the "fix" is still wrong.
 
     It issues real tool calls (Glob, Read, Write, Bash, ReportResult) through the normal agent loop
     and reacts to their actual results. It also respects the tools its profile offers: no Bash means
@@ -379,6 +394,7 @@ class SimulatedDeveloperProvider(BaseProvider):
         self.step = 0
         self.fixed = False
         self.verified: Optional[bool] = None
+        self.assignment = ""
 
     def _call(self, name: str, tool_input: dict[str, Any]) -> ChatResponse:
         self.step += 1
@@ -402,6 +418,7 @@ class SimulatedDeveloperProvider(BaseProvider):
         self.can_run = not offered or "Bash" in offered
         self.can_write = not offered or "Write" in offered
         assignment = next((m.get("content") or "" for m in messages if m.get("role") == "user"), "")
+        self.assignment = assignment
         task_text = assignment.split("## Task", 1)[-1].split("##", 1)[0]
         last_tool = next((m for m in reversed(messages) if m.get("role") == "tool"), None)
         if last_tool and last_tool.get("tool_call_id", "").startswith("sim_dev_") \
@@ -445,6 +462,37 @@ class SimulatedDeveloperProvider(BaseProvider):
         if self.fixed and self.step == 5:  # re-run after the fix
             return self._call("Bash", {"command": self._run_cmd(test_rel), "timeout_s": 300})
         return self._finish(rel, test_rel, ran=True, messages=messages)
+
+    # -- "create a function F(a, b) in X.py that returns a OP b" (repair-loop scenario) -----------
+    def _function(self, p, messages, last_tool) -> ChatResponse:
+        rel, func, op = p["path"], p["func"], p["op"]
+        from ..agents.developer import REPAIR_MARKER
+
+        repair = REPAIR_MARKER in self.assignment
+        if repair and not self.step and f"{func}()" not in self.assignment.split(REPAIR_MARKER, 1)[1]:
+            return self._report(status="failed", summary=f"The QA diagnosis does not identify {func}(); "
+                                "nothing to fix.", next_action="Human review.")
+        if not repair:
+            if self.step == 0:  # implementation (the scripted bug: wrong operator)
+                return self._call("Write", {"file_path": str(self.cwd / rel),
+                                            "content": f"def {func}(a, b):\n    return a {_WRONG_OP[op]} b\n"})
+            if self.step == 1:  # a correct test for the acceptance criterion
+                folder = Path(rel).parent.as_posix()
+                return self._call("Write", {"file_path": str(self.cwd / f"tests/test_{func}_function.py"), "content": (
+                    "import sys\nfrom pathlib import Path\n\n"
+                    f"sys.path.insert(0, str(Path(__file__).resolve().parents[1] / {folder!r}))\n\n"
+                    f"from {Path(rel).stem} import {func}  # noqa: E402\n\n\n"
+                    f"def test_{func}():\n    assert {func}(2, 3) == {eval(f'2 {op} 3')}\n")})
+            return self._report(status="completed", summary=f"Implemented {func}() in {rel}; tests pass.",
+                                files_changed=[rel, f"tests/test_{func}_function.py"])  # an unverified claim
+        if self.step == 0:  # repair: inspect the current implementation in the same worktree
+            return self._call("Read", {"file_path": str(self.cwd / rel)})
+        if self.step == 1:
+            fixed = f"a {op} b + 1" if self.unfixable else f"a {op} b"
+            return self._call("Write", {"file_path": str(self.cwd / rel),
+                                        "content": f"def {func}(a, b):\n    return {fixed}\n"})
+        return self._report(status="completed", summary=f"Applied the QA recommended fix to {func}() in {rel}.",
+                            files_changed=[rel])
 
     # -- "create X containing the contents of Y followed by 'Z'" ---------------------------------
     def _derive(self, p, messages, last_tool) -> ChatResponse:
@@ -515,6 +563,10 @@ def simulated_developer_factory(agent) -> SimulatedDeveloperProvider:
     return SimulatedDeveloperProvider(agent.working_directory)
 
 
+def simulated_qa_factory(agent) -> "SimulatedQAProvider":
+    return SimulatedQAProvider()
+
+
 # ---------------------------------------------------------------------------
 # Planning (Phase 3.1): a deterministic plan for offline use of `increscent plan --simulate`
 # ---------------------------------------------------------------------------
@@ -569,8 +621,27 @@ SIMULATED_PLAN: dict[str, Any] = {
 }
 
 
+SIMULATED_CALC_PLAN: dict[str, Any] = {
+    "project": {"name": "Calculator", "summary": "A minimal calculation module with a verified add() function."},
+    "requirements": ["add(a, b) returns the sum of a and b"],
+    "assumptions": ["Pure Python; no external dependencies"],
+    "architecture": {"frontend": "None", "backend": "Python module app/calc.py", "database": "None",
+                     "infrastructure": "None"},
+    "modules": [{"name": "calc", "description": "Arithmetic functions"}],
+    "tasks": [
+        {"id": "calculation", "title": "Implement calculation", "role": "backend", "dependencies": [],
+         "description": "Create a function add(a, b) in app/calc.py that returns a + b.",
+         "acceptance_criteria": ["add(2, 3) returns 5", "A test verifies add()"]},
+        {"id": "review", "title": "Review the calculation", "role": "reviewer", "dependencies": ["calculation"],
+         "description": "Verify that app/calc.py contains the text 'return a + b'.",
+         "acceptance_criteria": ["Approve or request changes with findings"]},
+    ],
+}
+
+
 class SimulatedPlannerProvider(BaseProvider):
-    """Deterministic offline planning model: always answers with :data:`SIMULATED_PLAN` as JSON.
+    """Deterministic offline planning model. It answers with :data:`SIMULATED_PLAN` as JSON, or with
+    :data:`SIMULATED_CALC_PLAN` when the requirement is about a calculation and no plan was given.
 
     It records the requests it receives so tests can check the prompt.
     """
@@ -580,11 +651,14 @@ class SimulatedPlannerProvider(BaseProvider):
     def __init__(self, plan: dict[str, Any] | None = None, model: str = "simulated-planner"):
         super().__init__(api_key="simulated", base_url=None, model=model)
         self.plan = plan if plan is not None else SIMULATED_PLAN
+        self._fixed_plan = plan is not None
         self.requests: list[list[dict[str, Any]]] = []
 
     def chat(self, messages, tools=None, **kwargs) -> ChatResponse:
         self.requests.append(list(messages))
-        return ChatResponse(content=json.dumps(self.plan, indent=2), model=self.model or "simulated-planner",
+        requirement = " ".join(str(m.get("content") or "") for m in messages if m.get("role") == "user").lower()
+        plan = SIMULATED_CALC_PLAN if not self._fixed_plan and "calculat" in requirement else self.plan
+        return ChatResponse(content=json.dumps(plan, indent=2), model=self.model or "simulated-planner",
                             usage={"input_tokens": 0, "output_tokens": 0}, finish_reason="stop")
 
     def chat_stream(self, messages, tools=None, **kwargs):

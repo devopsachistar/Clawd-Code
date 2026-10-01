@@ -15,6 +15,7 @@ Nothing is pushed, deployed or merged into the main branch.
 
 from __future__ import annotations
 
+import dataclasses
 import threading
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
@@ -36,6 +37,7 @@ from .state import EventRecorder, atomic_write_json, now_iso, resolve_state_dir
 from .testing import TestRun, run_tests
 
 INTEGRATION_ROLE = "integration"
+MAX_REPAIRS = 2  # hard cap on QA-guided repair attempts per task (Phase 3.3.2)
 
 
 @dataclass
@@ -49,6 +51,9 @@ class OrchestratorConfig:
     # "agent": Phase 2 path (runner + _verify_and_commit).
     # "developer": Phase 3.2 path: each task runs through DeveloperAgent.execute() (measured files/tests).
     executor: str = "agent"
+    # Developer path only: after a measured failure, QA diagnoses it and the developer repairs it
+    # in the same worktree, up to this many times (capped at MAX_REPAIRS). 0 = no repair loop.
+    max_repairs: int = 0
 
 
 @dataclass
@@ -73,8 +78,10 @@ class Orchestrator:
         approval_handler: ApprovalHandler | None = None,
         config: OrchestratorConfig | None = None,
         worktree_base: str | Path | None = None,
+        qa_provider_factory: ProviderFactory | None = None,
     ) -> None:
         self.config = config or OrchestratorConfig()
+        self.qa_provider_factory = qa_provider_factory or provider_factory  # QA diagnosis model (no tools)
         self.state_dir = resolve_state_dir(project_root)
         self.events = EventRecorder(self.state_dir)
         self.tasks = TaskStore(self.state_dir, events=self.events)
@@ -246,6 +253,23 @@ class Orchestrator:
                                    provider=self.config.provider, model=self.config.model,
                                    test_command=self.config.test_command)
         measured = developer.execute(spec, worktree.path, should_cancel=self._cancel.is_set)
+        attempt_log = [_developer_entry(1, measured)]
+        files = list(measured.files_changed)
+        limit = max(0, min(self.config.max_repairs, MAX_REPAIRS))
+        repairs = 0
+        while measured.status != "completed" and repairs < limit and measured.agent_id and not self._cancel.is_set():
+            diagnosis, qa_agent = self._diagnose(task, spec, measured, worktree)
+            attempt_log.append(_qa_entry(repairs + 1, qa_agent, diagnosis))
+            if diagnosis.status != "diagnosed":
+                break  # never repair blind
+            repairs += 1
+            self.events.emit("task.repair", task_id=task.id, graph_id=graph.id, attempt=repairs + 1,
+                             reason=diagnosis.summary[:200])
+            measured = developer.execute(_repair_spec(spec, measured, diagnosis, repairs, limit), worktree.path,
+                                         should_cancel=self._cancel.is_set)  # same worktree and branch
+            files = sorted(set(files) | set(measured.files_changed))
+            attempt_log.append(_developer_entry(repairs + 1, measured))
+        measured.files_changed = files
         tests = ({"command": measured.test_command, "run": measured.tests_run, "passed": measured.tests_passed,
                   "failed": measured.tests_failed, "output_tail": measured.test_output}
                  if measured.test_command else {})
@@ -267,8 +291,44 @@ class Orchestrator:
         agent = self.agents.get(measured.agent_id) if measured.agent_id else None
         if agent is None:
             self._record_failure(task.id, None, result, measured.error or "developer agent did not run")
-            return
-        self._record_result(task.id, agent, result)
+        else:
+            self._record_result(task.id, agent, result)
+        if limit:
+            attempt_log.append({"step": "final", "status": "COMPLETED" if result.status == "completed" else "FAILED",
+                                "repairs": repairs, "commit": commit})
+
+            def log(t: Task) -> None:  # small structured record of every developer/QA step
+                if t.result is not None:
+                    t.result["attempt_log"] = attempt_log
+                if t.history:
+                    t.history[-1]["attempt_log"] = attempt_log
+
+            self.tasks.mutate(task.id, log)
+
+    def _diagnose(self, task: Task, spec: TaskSpec, measured, worktree):
+        """Read-only QA diagnosis of a measured failure (existing QADiagnoser; the model gets no tools)."""
+        from ..agents.qa import QADiagnoser, QADiagnosis
+
+        qa_profile = next((p for p in self.profiles.all() if p.role.lower() == "qa"), None)
+        if qa_profile is None:
+            return QADiagnosis(status="inconclusive", summary="No QA profile is configured.", task_id=task.id), None
+        qa_profile = _read_only(qa_profile)
+        agent = self.runner.create_agent(qa_profile, task_id=task.id, working_directory=worktree.path,
+                                         provider=self.config.provider, model=self.config.model,
+                                         attempt=task.attempts)
+        agent.transition(AgentStatus.RUNNING)
+        self.agents.save(agent)
+        try:
+            diagnosis = QADiagnoser(self.qa_provider_factory(agent)).diagnose(spec, measured)
+        except Exception as e:  # provider construction failed; QADiagnoser itself never raises
+            diagnosis = QADiagnosis(status="inconclusive", summary="The QA model could not be created.",
+                                    task_id=task.id, warnings=[f"{type(e).__name__}: {e}"])
+        agent.result = diagnosis.to_dict()
+        agent.transition(AgentStatus.COMPLETED if diagnosis.status == "diagnosed" else AgentStatus.FAILED)
+        self.agents.save(agent)
+        self.events.emit("qa.diagnosed", task_id=task.id, agent_id=agent.id, status=diagnosis.status,
+                         reason=diagnosis.summary[:200])
+        return diagnosis, agent.id
 
     def _prepare_worktree(self, task: Task, graph: TaskGraph):
         deps = [self.tasks.require(d) for d in task.dependencies]
@@ -580,3 +640,51 @@ def simulated_orchestrator(project_root: str | Path, **kwargs: Any) -> Orchestra
 
 
 __all__ = ["Orchestrator", "OrchestratorConfig", "RunSummary", "simulated_orchestrator", "Callable"]
+
+
+# -- QA-guided repair (Phase 3.3.2) ------------------------------------------------------------
+
+def _read_only(profile):
+    """The QA profile as used for diagnosis: no tools at all, READ capability only."""
+    from ..security.permissions import Capability
+
+    every = set(profile.allow) | set(profile.ask) | set(profile.deny)
+    return dataclasses.replace(profile, allowed_tools=(), allow=frozenset({Capability.READ}), ask=frozenset(),
+                               deny=frozenset(every - {Capability.READ}), commits=False)
+
+
+def _developer_entry(attempt: int, measured) -> dict[str, Any]:
+    return {"step": "developer", "attempt": attempt, "repair": attempt > 1, "agent": measured.agent_id,
+            "status": measured.status, "agent_claimed": measured.agent_reported_status,
+            "tests": {"run": measured.tests_run, "passed": measured.tests_passed, "failed": measured.tests_failed},
+            "files_changed": list(measured.files_changed), "error": measured.error}
+
+
+def _qa_entry(after_attempt: int, agent_id, diagnosis) -> dict[str, Any]:
+    return {"step": "qa", "after_attempt": after_attempt, "agent": agent_id, "status": diagnosis.status,
+            "confidence": diagnosis.confidence, "summary": diagnosis.summary,
+            "failures": [dataclasses.asdict(f) for f in diagnosis.failures],
+            "recommended_fixes": list(diagnosis.recommended_fixes), "warnings": list(diagnosis.warnings)}
+
+
+def _repair_spec(spec: TaskSpec, measured, diagnosis, repair: int, limit: int) -> TaskSpec:
+    """The original task, unchanged, followed by the repair context (failure, QA diagnosis, test output)."""
+    from ..agents.developer import REPAIR_MARKER
+
+    failures = [f"- {f.test}: {f.error}\n  likely cause: {f.likely_cause}\n  evidence: {f.evidence}"
+                for f in diagnosis.failures]
+    output = (measured.test_output or "").strip()[-2000:]
+    context = [
+        "", "", f"{REPAIR_MARKER} {repair} of {limit}",
+        "This is a REPAIR attempt. Your previous implementation of the task above failed measured verification.",
+        "The original task and its acceptance criteria are unchanged. Fix the existing implementation in this",
+        "same workspace (its files are already here); do not start over and do not work anywhere else.",
+        "", "### Previous failure",
+        f"Summary: {measured.summary or '-'}", f"Error: {measured.error or '-'}",
+        f"Measured tests: run {measured.tests_run}, passed {measured.tests_passed}, failed {measured.tests_failed}"
+        + (f" ({measured.test_command})" if measured.test_command else ""),
+        "", f"### QA diagnosis ({diagnosis.status}, confidence {diagnosis.confidence})", diagnosis.summary,
+        *failures, "Recommended fixes:", *[f"- {x}" for x in diagnosis.recommended_fixes],
+        "", "### Relevant test output", "```", output or "(none)", "```",
+    ]
+    return dataclasses.replace(spec, description=spec.description.rstrip() + "\n".join(context))
