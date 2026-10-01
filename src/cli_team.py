@@ -32,6 +32,15 @@ def add_team_commands(subparsers: argparse._SubParsersAction, add_common) -> Non
     team.add_argument("--json", action="store_true", help="Print the run summary as JSON")
     add_common(team, suppress=True)
 
+    plan = subparsers.add_parser("plan", help="Turn a requirement into a validated plan and task graph (AI planner)")
+    plan.add_argument("requirement", nargs="*", help="Natural-language requirement")
+    plan.add_argument("--simulate", action="store_true",
+                      help="Use the deterministic offline planning model instead of a real provider")
+    plan.add_argument("--no-save", action="store_true", help="Only print the plan; do not create a task graph")
+    plan.add_argument("--json", action="store_true", help="Print the validated plan as JSON")
+    plan.add_argument("--cwd", help="Project directory (default: current directory)")
+    add_common(plan, suppress=True)
+
     agents = subparsers.add_parser("agents", help="List agents")
     agents.add_argument("--graph", help="Only agents of this graph")
     agents.add_argument("--cwd")
@@ -240,6 +249,97 @@ def handle_team(args) -> int:
     return EXIT_OK if summary.status == "REVIEW" else EXIT_FAILURE
 
 
+def handle_plan(args) -> int:
+    """Requirement -> Planner (LLM) -> validated plan -> existing Task Graph."""
+    from .agents.profiles import ProfileRegistry
+    from .config import ConfigError, create_provider, missing_api_key_message, resolve_provider_config
+    from .gitops.worktrees import GitError
+    from .orchestration.ai_planner import Planner, PlanningError, plan_to_task_graph
+    from .orchestration.orchestrator import Orchestrator
+    from .project import detect_project
+    from .taskgraph.store import TaskGraphError
+
+    requirement = " ".join(args.requirement).strip()
+    if not requirement:
+        print("Error: give a requirement, e.g. increscent plan \"Build a task management application\"", file=sys.stderr)
+        return EXIT_CONFIG
+    project = detect_project(Path(args.cwd).expanduser() if args.cwd else None)
+    if project.is_unsafe_root:
+        print(f"Error: refusing to plan in {project.project_root} (home directory or filesystem root)", file=sys.stderr)
+        return EXIT_CONFIG
+    save = not args.no_save
+    if save and not project.is_git_repo:
+        print("Error: saving the task graph needs a git repository with a commit "
+              "(or use --no-save to only print the plan)", file=sys.stderr)
+        return EXIT_CONFIG
+    profiles = ProfileRegistry.load(project.project_root)
+
+    if args.simulate:
+        from .orchestration.simulation import SimulatedPlannerProvider
+
+        provider = SimulatedPlannerProvider()
+    else:
+        try:
+            resolved = resolve_provider_config(cli_provider=getattr(args, "provider", None),
+                                               cli_model=getattr(args, "model", None),
+                                               cli_base_url=getattr(args, "base_url", None),
+                                               project_root=project.project_root)
+            if not resolved.has_api_key:
+                print(f"Error: {missing_api_key_message(resolved)}", file=sys.stderr)
+                return EXIT_CONFIG
+            provider = create_provider(resolved)
+        except (ConfigError, ImportError) as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return EXIT_CONFIG
+
+    try:
+        plan = Planner(provider, profiles).create_plan(requirement)
+    except PlanningError as e:
+        print(f"Planning failed: {e}", file=sys.stderr)
+        return EXIT_FAILURE
+
+    graph = None
+    if save:
+        def no_agents(agent):  # planning never runs agents
+            raise RuntimeError("plan does not run agents")
+
+        try:
+            orch = Orchestrator(project.project_root, provider_factory=no_agents, profiles=profiles)
+            graph = plan_to_task_graph(plan, orch, requirement)
+        except GitError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return EXIT_CONFIG
+        except (TaskGraphError, ValueError, KeyError) as e:
+            print(f"Planning failed: the plan was rejected by the task graph: {e}", file=sys.stderr)
+            return EXIT_FAILURE
+
+    if args.json:
+        print(json.dumps({"plan": plan.to_dict(), "graph_id": graph.id if graph else None}, indent=2))
+        return EXIT_OK
+    print(render_plan(plan, graph))
+    return EXIT_OK
+
+
+def render_plan(plan, graph=None) -> str:
+    lines = ["PROJECT", f"  {plan.project_name}", "", "SUMMARY", f"  {plan.summary}", "", "REQUIREMENTS"]
+    lines += [f"  - {r}" for r in plan.requirements]
+    if plan.assumptions:
+        lines += ["", "ASSUMPTIONS"] + [f"  - {a}" for a in plan.assumptions]
+    lines += ["", "ARCHITECTURE"] + [f"  {k.capitalize():<15} {v or '-'}" for k, v in plan.architecture.items()]
+    if plan.modules:
+        lines += ["", "MODULES"] + [f"  - {m.name}: {m.description}" for m in plan.modules]
+    lines += ["", "TASKS"]
+    for i, t in enumerate(plan.tasks, start=1):
+        after = f"  (after: {', '.join(t.dependencies)})" if t.dependencies else ""
+        lines.append(f"  {i}. {t.title}  [{t.role}]{after}")
+    if graph is not None:
+        lines += ["", f"Task graph {graph.id} created ({len(plan.tasks)} tasks). Inspect with: increscent tasks --graph "
+                      f"{graph.id}   Run with: increscent team --resume {graph.id}"]
+    else:
+        lines += ["", "Plan only (not saved)."]
+    return "\n".join(lines)
+
+
 def _print_tasks(console: Console, tasks) -> None:
     table = Table(show_header=True, header_style="bold")
     for col in ("Task", "Title", "Profile", "Status", "Att.", "Deps", "Branch"):
@@ -407,6 +507,7 @@ def handle_review(args) -> int:
 
 HANDLERS = {
     "team": handle_team,
+    "plan": handle_plan,
     "tasks": handle_tasks,
     "task": handle_task,
     "agents": handle_agents,

@@ -296,3 +296,82 @@ class SimulatedAgentProvider(BaseProvider):
 
 def simulated_provider_factory(agent) -> SimulatedAgentProvider:
     return SimulatedAgentProvider(agent.role, agent.working_directory)
+
+
+# ---------------------------------------------------------------------------
+# Planning (Phase 3.1): a deterministic plan for offline use of `increscent plan --simulate`
+# ---------------------------------------------------------------------------
+
+SIMULATED_PLAN: dict[str, Any] = {
+    "project": {
+        "name": "Task Manager",
+        "summary": "A small web application for managing users, projects and prioritised tasks with a dashboard.",
+    },
+    "requirements": [
+        "Users can register and sign in",
+        "Users can create projects and add tasks to them",
+        "Tasks have a title, status and priority (low/medium/high)",
+        "A dashboard shows open tasks per project and by priority",
+    ],
+    "assumptions": [
+        "Single organisation; no multi-tenancy",
+        "SQLite is sufficient for the first version",
+    ],
+    "architecture": {
+        "frontend": "Server-rendered HTML templates",
+        "backend": "Python web API with a service layer",
+        "database": "SQLite via a repository layer",
+        "infrastructure": "Single container; no deployment in this phase",
+    },
+    "modules": [
+        {"name": "auth", "description": "User registration and sessions"},
+        {"name": "projects", "description": "Project CRUD"},
+        {"name": "tasks", "description": "Task CRUD, status and priority"},
+        {"name": "dashboard", "description": "Aggregated views of open work"},
+    ],
+    "tasks": [
+        {"id": "architecture", "title": "Design the architecture", "role": "architect", "dependencies": [],
+         "description": "Define modules, data model and API boundaries.",
+         "acceptance_criteria": ["docs/ARCHITECTURE.md covers modules, data model and API"]},
+        {"id": "database", "title": "Implement the data model", "role": "database", "dependencies": ["architecture"],
+         "description": "Users, projects and tasks tables with a repository layer.",
+         "acceptance_criteria": ["Schema covers users, projects, tasks and priority"]},
+        {"id": "backend", "title": "Implement the backend API", "role": "backend", "dependencies": ["database"],
+         "description": "Auth, project and task endpoints with validation.",
+         "acceptance_criteria": ["CRUD endpoints for projects and tasks", "Invalid input is rejected"]},
+        {"id": "frontend", "title": "Implement the frontend and dashboard", "role": "frontend",
+         "dependencies": ["backend"], "description": "Pages for projects, tasks and the dashboard.",
+         "acceptance_criteria": ["Dashboard shows open tasks per project and priority"]},
+        {"id": "tests", "title": "Write integration tests", "role": "qa", "dependencies": ["frontend"],
+         "description": "End-to-end tests of the main user flows.",
+         "acceptance_criteria": ["Main flows are covered and pass"]},
+        {"id": "review", "title": "Review the changes", "role": "reviewer", "dependencies": ["tests"],
+         "description": "Review correctness, tests and risks.",
+         "acceptance_criteria": ["Approve or request changes with findings"]},
+    ],
+}
+
+
+class SimulatedPlannerProvider(BaseProvider):
+    """Deterministic offline planning model: always answers with :data:`SIMULATED_PLAN` as JSON.
+
+    It records the requests it receives so tests can check the prompt.
+    """
+
+    message_format = "openai"
+
+    def __init__(self, plan: dict[str, Any] | None = None, model: str = "simulated-planner"):
+        super().__init__(api_key="simulated", base_url=None, model=model)
+        self.plan = plan if plan is not None else SIMULATED_PLAN
+        self.requests: list[list[dict[str, Any]]] = []
+
+    def chat(self, messages, tools=None, **kwargs) -> ChatResponse:
+        self.requests.append(list(messages))
+        return ChatResponse(content=json.dumps(self.plan, indent=2), model=self.model or "simulated-planner",
+                            usage={"input_tokens": 0, "output_tokens": 0}, finish_reason="stop")
+
+    def chat_stream(self, messages, tools=None, **kwargs):
+        yield self.chat(messages, tools=tools, **kwargs).content
+
+    def get_available_models(self) -> list[str]:
+        return ["simulated-planner"]
