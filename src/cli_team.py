@@ -41,6 +41,19 @@ def add_team_commands(subparsers: argparse._SubParsersAction, add_common) -> Non
     plan.add_argument("--cwd", help="Project directory (default: current directory)")
     add_common(plan, suppress=True)
 
+    develop = subparsers.add_parser("develop", help="Run ONE developer-agent task (isolated worktree; no commit)")
+    develop.add_argument("task", nargs="*", help="Task description")
+    develop.add_argument("--accept", action="append", default=[], metavar="CRITERION",
+                         help="Acceptance criterion (repeatable)")
+    develop.add_argument("--simulate", action="store_true",
+                         help="Use the deterministic offline developer (supports 'Create a file named X containing Y')")
+    develop.add_argument("--workspace", help="Run in this existing directory instead of a new git worktree")
+    develop.add_argument("--test-command", help="Command used to verify the result (default: auto-detect)")
+    develop.add_argument("-y", "--yes", action="store_true", help="Auto-approve LOW/MEDIUM-risk approval requests")
+    develop.add_argument("--json", action="store_true", help="Print the structured result as JSON")
+    develop.add_argument("--cwd", help="Project directory (default: current directory)")
+    add_common(develop, suppress=True)
+
     agents = subparsers.add_parser("agents", help="List agents")
     agents.add_argument("--graph", help="Only agents of this graph")
     agents.add_argument("--cwd")
@@ -320,6 +333,109 @@ def handle_plan(args) -> int:
     return EXIT_OK
 
 
+def handle_develop(args) -> int:
+    """TaskSpec -> DeveloperAgent (existing AgentRunner) -> verified DeveloperResult."""
+    import uuid
+
+    from .agents.developer import DeveloperAgent
+    from .agents.profiles import ProfileRegistry
+    from .agents.store import AgentStore
+    from .config import ConfigError, create_provider, missing_api_key_message, resolve_provider_config
+    from .gitops.worktrees import GitError, WorktreeManager
+    from .orchestration.planner import TaskSpec
+    from .orchestration.state import EventRecorder, resolve_state_dir
+    from .project import detect_project
+
+    text = " ".join(args.task).strip()
+    if not text:
+        print("Error: give a task, e.g. increscent develop --simulate \"Create a file named hello.txt containing "
+              "the text 'Hello from Increscent Factory'\"", file=sys.stderr)
+        return EXIT_CONFIG
+    project = detect_project(Path(args.cwd).expanduser() if args.cwd else None)
+    if project.is_unsafe_root:
+        print(f"Error: refusing to run in {project.project_root} (home directory or filesystem root)", file=sys.stderr)
+        return EXIT_CONFIG
+
+    if args.simulate:
+        from .orchestration.simulation import simulated_developer_factory
+
+        factory, provider_name, model = simulated_developer_factory, "simulated", "simulated-developer"
+    else:
+        try:
+            resolved = resolve_provider_config(cli_provider=getattr(args, "provider", None),
+                                               cli_model=getattr(args, "model", None),
+                                               cli_base_url=getattr(args, "base_url", None),
+                                               project_root=project.project_root)
+        except ConfigError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return EXIT_CONFIG
+        if not resolved.has_api_key:
+            print(f"Error: {missing_api_key_message(resolved)}", file=sys.stderr)
+            return EXIT_CONFIG
+
+        def factory(agent):
+            return create_provider(dataclasses.replace(resolved, model=agent.model or resolved.model))
+
+        provider_name, model = resolved.provider, resolved.model
+
+    task_id = f"dev-{uuid.uuid4().hex[:6]}"
+    lock = None
+    branch = None
+    if args.workspace:
+        workspace = Path(args.workspace).expanduser().resolve()
+        if not workspace.is_dir():
+            print(f"Error: workspace does not exist: {workspace}", file=sys.stderr)
+            return EXIT_CONFIG
+    else:
+        if not project.is_git_repo:
+            print("Error: needs a git repository with a commit (the task runs in an isolated worktree), "
+                  "or pass --workspace DIR", file=sys.stderr)
+            return EXIT_CONFIG
+        try:
+            manager = WorktreeManager(project.project_root)
+            wt = manager.create(task_id, "developer")
+            lock = manager.acquire(wt.name, owner=task_id)
+        except GitError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return EXIT_CONFIG
+        workspace, branch = Path(wt.path), wt.branch
+
+    state = resolve_state_dir(project.project_root)
+    profiles = ProfileRegistry.load(project.project_root)
+    developer = DeveloperAgent(factory, profiles=profiles, provider=provider_name, model=model,
+                               events=EventRecorder(state), store=AgentStore(state), sessions_dir=state / "sessions",
+                               approval_handler=make_approval_handler(args.yes), test_command=args.test_command)
+    task = TaskSpec(key=task_id, title=text[:80], description=text, profile="Developer", acceptance=tuple(args.accept))
+    try:
+        result = developer.execute(task, workspace)
+    finally:
+        if lock is not None:
+            lock.release()
+
+    if args.json:
+        print(json.dumps({**result.to_dict(), "branch": branch}, indent=2))
+    else:
+        tests = ("none detected" if result.test_command is None else
+                 f"{'passed' if result.tests_failed == 0 and result.tests_run else 'FAILED'} "
+                 f"(run {result.tests_run}, passed {result.tests_passed}, failed {result.tests_failed})")
+        lines = ["DEVELOPER AGENT" + ("  (SIMULATION: offline scripted developer)" if args.simulate else ""), "",
+                 "Task:", f"  {text}"]
+        if task.acceptance:
+            lines += ["", "Acceptance criteria:"] + [f"  - {c}" for c in task.acceptance]
+        lines += ["", "Workspace:", f"  {workspace}" + (f"  (branch {branch}; not committed)" if branch else ""), "",
+                  "Files changed:"] + ([f"  {f}" for f in result.files_changed] or ["  (none)"])
+        lines += ["", "Tests:", f"  {tests}"]
+        if result.summary:
+            lines += ["", "Summary:", f"  {result.summary}"]
+        if result.error:
+            lines += ["", "Error:", f"  {result.error}"]
+        for w in result.warnings:
+            lines.append(f"  warning: {w}")
+        lines += ["", "RESULT:", f"  {result.status.upper()}"]
+        print("\n".join(lines))
+    return EXIT_OK if result.status == "completed" else EXIT_FAILURE
+
+
 def render_plan(plan, graph=None) -> str:
     lines = ["PROJECT", f"  {plan.project_name}", "", "SUMMARY", f"  {plan.summary}", "", "REQUIREMENTS"]
     lines += [f"  - {r}" for r in plan.requirements]
@@ -508,6 +624,7 @@ def handle_review(args) -> int:
 HANDLERS = {
     "team": handle_team,
     "plan": handle_plan,
+    "develop": handle_develop,
     "tasks": handle_tasks,
     "task": handle_task,
     "agents": handle_agents,

@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+from pathlib import Path
 from typing import Any, Callable
 
 from ..providers.base import BaseProvider, ChatResponse
@@ -296,6 +297,107 @@ class SimulatedAgentProvider(BaseProvider):
 
 def simulated_provider_factory(agent) -> SimulatedAgentProvider:
     return SimulatedAgentProvider(agent.role, agent.working_directory)
+
+
+# ---------------------------------------------------------------------------
+# Developer agent (Phase 3.2.1): deterministic offline developer for `increscent develop --simulate`
+# ---------------------------------------------------------------------------
+
+_CREATE_FILE_TASK = re.compile(
+    r"create\s+(?:a\s+)?(?:new\s+)?(?:file\s+)?(?:named\s+|called\s+)?[`'\"]?(?P<path>[\w.\-/\\]+\.\w+)[`'\"]?\s+"
+    r"(?:containing|with)\s+(?:the\s+)?(?:text|content|contents)?\s*"
+    r"(?:[`'\"“](?P<quoted>.+?)[`'\"”]|(?P<bare>[^\n]+?))\s*\.?\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+class SimulatedDeveloperProvider(BaseProvider):
+    """Scripted developer for ONE kind of task: "Create a file named X containing 'Y'".
+
+    It issues real tool calls (Glob, Write, Bash, ReportResult) through the normal
+    agent loop and reacts to the actual tool results: it reads the pytest output
+    and fixes the file once if the test fails. ``inject_bug`` writes wrong content
+    first (to exercise the fix path); ``unfixable`` never fixes it (to exercise
+    the failure path). It is not an AI and cannot do any other task.
+    """
+
+    message_format = "openai"
+
+    def __init__(self, working_directory: str, *, inject_bug: bool = False, unfixable: bool = False,
+                 model: str = "simulated-developer"):
+        super().__init__(api_key="simulated", base_url=None, model=model)
+        self.cwd = Path(working_directory)
+        self.inject_bug = inject_bug or unfixable
+        self.unfixable = unfixable
+        self.step = 0
+        self.fixed = False
+
+    def _call(self, name: str, tool_input: dict[str, Any]) -> ChatResponse:
+        self.step += 1
+        return ChatResponse(content="", model=self.model or "simulated-developer", usage={}, finish_reason="tool_calls",
+                            tool_uses=[{"id": f"sim_dev_{self.step}", "name": name, "input": tool_input}])
+
+    def _report(self, **fields: Any) -> ChatResponse:
+        return self._call("ReportResult", fields)
+
+    def chat(self, messages, tools=None, **kwargs) -> ChatResponse:
+        messages = list(messages)
+        assignment = next((m.get("content") or "" for m in messages if m.get("role") == "user"), "")
+        task_text = assignment.split("## Task", 1)[-1].split("##", 1)[0]
+        match = _CREATE_FILE_TASK.search(task_text)
+        last_tool = next((m for m in reversed(messages) if m.get("role") == "tool"), None)
+        if last_tool and last_tool.get("tool_call_id", "").startswith("sim_dev_") and '"recorded": true' in (last_tool.get("content") or ""):
+            return ChatResponse(content="Done.", model=self.model or "", usage={}, finish_reason="stop")
+        if match is None:
+            if self.step:
+                return ChatResponse(content="Done.", model=self.model or "", usage={}, finish_reason="stop")
+            return self._report(status="failed", summary="The simulated developer only supports tasks of the form "
+                                "\"Create a file named X containing 'Y'\".", next_action="Use a real model provider.")
+        rel = match.group("path").replace("\\", "/")
+        text = match.group("quoted") if match.group("quoted") is not None else match.group("bare").strip()
+        target = self.cwd / rel
+        test_rel = f"tests/test_{re.sub(r'[^A-Za-z0-9]+', '_', Path(rel).stem).strip('_').lower() or 'file'}_content.py"
+        py = f'"{sys.executable}"'
+        run_cmd = f"{py} -m pytest -q -p no:cacheprovider {test_rel}"
+
+        if self.step == 0:  # 1. inspect the workspace
+            return self._call("Glob", {"pattern": "**/*", "path": str(self.cwd)})
+        if self.step == 1:  # 2. implement (optionally with an injected bug)
+            content = text.upper() if self.inject_bug else text
+            return self._call("Write", {"file_path": str(target), "content": content + "\n"})
+        if self.step == 2:  # 3. add a test for the acceptance criterion
+            depth = len(Path(test_rel).parent.parts)
+            return self._call("Write", {"file_path": str(self.cwd / test_rel), "content": (
+                "from pathlib import Path\n\n\n"
+                f"def test_{Path(test_rel).stem[5:]}():\n"
+                f"    root = Path(__file__).resolve().parents[{depth}]\n"
+                f"    assert (root / {rel!r}).read_text(encoding=\"utf-8\").strip() == {text!r}\n")})
+        if self.step == 3:  # 4. run the tests
+            return self._call("Bash", {"command": run_cmd, "timeout_s": 300})
+        counts = _last_tests(messages)
+        if counts[2] > 0 and not self.fixed and not self.unfixable:  # 5. inspect the failure and fix
+            self.fixed = True
+            return self._call("Write", {"file_path": str(target), "content": text + "\n"})
+        if self.fixed and self.step == 5:  # 6. re-run after the fix
+            return self._call("Bash", {"command": run_cmd, "timeout_s": 300})
+        ok = counts[2] == 0 and counts[0] > 0
+        return self._report(
+            status="completed" if ok else "failed",
+            summary=(f"Created {rel} with the requested text and a test that verifies it."
+                     if ok else f"Could not make the test for {rel} pass."),
+            files_changed=[rel, test_rel], tests_run=counts[0], tests_passed=counts[1], tests_failed=counts[2],
+            next_action="Review the change." if ok else "Investigate the failing test.",
+        )
+
+    def chat_stream(self, messages, tools=None, **kwargs):
+        yield self.chat(messages, tools=tools, **kwargs).content
+
+    def get_available_models(self) -> list[str]:
+        return ["simulated-developer"]
+
+
+def simulated_developer_factory(agent) -> SimulatedDeveloperProvider:
+    return SimulatedDeveloperProvider(agent.working_directory)
 
 
 # ---------------------------------------------------------------------------
